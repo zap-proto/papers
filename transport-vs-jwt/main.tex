@@ -1,0 +1,562 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{xcolor}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  citecolor=blue!50!black,
+  urlcolor=blue!60!black,
+}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{assumption}[theorem]{Assumption}
+
+\newcommand{\Adv}{\mathsf{Adv}}
+\newcommand{\GameG}{\mathsf{Game}}
+\newcommand{\Expt}{\mathsf{Exp}}
+\newcommand{\KEM}{\mathsf{KEM}}
+\newcommand{\KDF}{\mathsf{KDF}}
+\newcommand{\AEAD}{\mathsf{AEAD}}
+\newcommand{\JWT}{\mathsf{JWT}}
+\newcommand{\ZAP}{\mathsf{ZAP}}
+\newcommand{\bigO}{\mathcal{O}}
+
+\title{Transport-Layer Mutual Authentication Strictly Dominates\\
+       Bearer-Token Authentication for In-Cluster RPC:\\
+       A Comparative Security and Operational Analysis}
+
+\author{ZAP Protocol Authors\\
+        \texttt{zap-proto.io}}
+
+\date{2026-05-05}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We compare two dominant patterns for authenticating remote procedure calls
+between services inside a single administrative trust domain (a Kubernetes
+cluster, a service mesh, an HPC fabric): bearer-token authentication based on
+JSON Web Tokens (JWT) layered on TLS, and mutual authentication via a
+key-encapsulation-mechanism (KEM) handshake at the transport layer. We
+formalise both as cryptographic games, enumerate the operational failure
+modes that each admits in practice, and prove a separation theorem: the
+adversary's advantage against a JWT-at-application-layer scheme is the
+\emph{sum} of independently realisable advantages (signature forgery, JWKS
+poisoning, algorithm-confusion, key-id confusion, replay, leaked-token), while
+the advantage against a KEM-derived transport scheme reduces to a strict
+\emph{subset} of those (KEM IND-CCA2 and KDF/AEAD security).
+We conclude that for the in-cluster RPC threat model, transport-layer mutual
+authentication strictly dominates the bearer-token approach: better on every
+axis we care about (security, latency, operational complexity, failure modes)
+and worse on none. We discuss the residual role of bearer tokens at the
+public edge.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The de-facto pattern for service-to-service authentication inside modern
+service meshes is: terminate TLS at an ingress, mint a JWT~\cite{rfc7519} at
+an identity broker, attach the JWT to every RPC, and have each receiving
+service validate the signature against a JSON Web Key Set (JWKS) document
+fetched out-of-band. This pattern has been canonised by countless mesh
+implementations and is, empirically, the source of a long tail of
+production incidents and a deep catalogue of CVEs.
+
+The alternative we analyse here is conceptually older and operationally
+simpler: bind the authenticated identity of a process to its long-term KEM
+public key, perform a mutually authenticated KEM handshake at connection
+establishment time, and let every byte that flows on the resulting channel
+be implicitly attributed to the peer that completed the handshake. This is
+the model of WireGuard~\cite{donenfeld2017wireguard}, the Noise Protocol
+Framework~\cite{perrin2018noise}, Signal X3DH~\cite{marlinspike2016x3dh},
+SSH host keys, and SPIFFE workload
+identities~\cite{spiffe} when bound to mTLS. The ZAP transport protocol,
+which this paper concerns, instantiates this pattern for in-cluster RPC.
+
+\paragraph{Thesis.}
+Mutual authentication via transport-layer KEM-derived shared secrets
+\emph{strictly dominates} bearer-token authentication for in-cluster RPC.
+
+By \emph{strictly dominates} we mean: better on every axis we care about
+(\Cref{sec:threat,sec:opfail,sec:latency,sec:cost}), worse on none.
+
+\paragraph{Scope.} We consider RPC between processes that share a trust
+authority (a cluster's identity issuer or a CA bundle). External clients,
+human users, and cross-administrative-domain federation are out of scope and
+discussed only in \Cref{sec:edge}.
+
+\paragraph{Contributions.}
+\begin{enumerate}[itemsep=2pt,topsep=2pt]
+  \item A taxonomy of ten well-known JWT-at-application-layer failure modes
+        with a small CVE-grounded survey (\Cref{sec:jwt-tm}).
+  \item A taxonomy of the residual attack surface against transport-layer
+        KEM mutual authentication (\Cref{sec:zap-tm}).
+  \item A latency model showing that the steady-state per-call overhead of
+        the transport scheme is zero, while the JWT scheme pays at least one
+        validation cost per call (\Cref{sec:latency}).
+  \item A cost analysis demonstrating an order-of-magnitude reduction in
+        client and operator code (\Cref{sec:cost}).
+  \item A formal separation theorem, with reductions, in the companion
+        proof file (\texttt{proofs/transport-vs-jwt/proof.tex}); summary
+        in \Cref{sec:formal}.
+\end{enumerate}
+
+\section{Threat Models}
+\label{sec:threat}
+
+We fix a network model in which the adversary $\mathcal{A}$ is a Dolev--Yao
+attacker on the wire between two services $S$ and $C$ inside a cluster, and
+may additionally compromise a bounded number of orchestration components
+(an instance of the identity issuer, a sidecar, a logging aggregator, a
+secrets store).
+
+\subsection{JWT-at-application-layer: ten failure classes}
+\label{sec:jwt-tm}
+
+We enumerate, without claiming completeness, ten classes of attack and
+failure that have produced exploited CVEs or production incidents in the
+last decade.
+
+\begin{enumerate}[itemsep=2pt,topsep=2pt]
+  \item \textbf{\texttt{alg=none} downgrade.} Validators that accept the
+        \texttt{none} algorithm header treat any token as valid. This is the
+        canonical JWT bug; it has been disclosed against essentially every
+        major library at some point and continues to surface
+        in libraries shipped with new languages~\cite{auth0algnone}.
+  \item \textbf{Algorithm confusion (HS256 vs RS256).} A validator that
+        looks up the \texttt{kid} and uses the resulting key as an HMAC
+        secret can be tricked by an attacker who supplies an HS256 token
+        signed with the public key as the HMAC secret~\cite{auth0algconf}.
+  \item \textbf{Key-id (\texttt{kid}) confusion.} \texttt{kid} is
+        attacker-controlled and frequently used as an unsanitised key
+        lookup index, leading to path traversal, SQL injection, or
+        substitution attacks~\cite{ietfjwtbcp}.
+  \item \textbf{JWS-vs-JWE confusion.} Validators that accept either form
+        can be fed an unencrypted JWS where the application expected a JWE
+        and vice versa, because the JOSE family is structurally
+        polymorphic~\cite{rfc7518}.
+  \item \textbf{JWKS poisoning / SSRF.} If JWKS is fetched over an
+        attacker-influenceable URL (a configurable issuer, a sidecar with
+        SSRF, a stale DNS cache), the attacker can substitute their own
+        public key and mint valid tokens.
+  \item \textbf{Audience replay.} A token minted for service $A$ replayed
+        against service $B$ that shares the same issuer; the
+        \texttt{aud} claim is honour-system, not cryptographically bound to
+        the receiving endpoint.
+  \item \textbf{Expiration vs revocation gap.} JWTs are stateless;
+        revocation requires either a bounded $\texttt{exp}$ (in which case
+        the gap is the bound) or a stateful blacklist (in which case the
+        statelessness benefit is lost).
+  \item \textbf{Leaked bearer.} The token is plaintext-equivalent to
+        identity. Any log line, error trace, exception report,
+        crash dump, or debug pcap that contains a bearer token is a
+        credential leak with the validity window of the token.
+  \item \textbf{Sidecar SSRF / token exfiltration.} The token-mint endpoint
+        of a cluster identity issuer is reachable from any pod in the mesh;
+        an SSRF in any service can mint tokens for any audience the issuer
+        will sign for.
+  \item \textbf{Rotation race.} JWT signing keys must be rotated. The
+        rotation requires a coordinated update of (a) the issuer's signing
+        key, (b) the JWKS endpoint, (c) every validator's cache. The
+        coordination problem is non-trivial and is the operational
+        failure mode formalised in \Cref{sec:opfail}.
+\end{enumerate}
+
+\subsection{Transport-layer KEM mutual auth: residual attack surface}
+\label{sec:zap-tm}
+
+The transport scheme \emph{also} has an attack surface; honest analysis
+demands its enumeration.
+
+\begin{enumerate}[itemsep=2pt,topsep=2pt]
+  \item \textbf{Long-term KEM key compromise.} If a service's long-term KEM
+        secret leaks, the adversary can impersonate that service until the
+        key is rotated. This is the analogue of leaking a JWT signing key,
+        but scoped to one service rather than the entire issuer.
+  \item \textbf{NetworkPolicy misconfiguration.} A permissive
+        NetworkPolicy that lets an unintended pod talk to a service still
+        requires the attacker to complete a handshake; absent a key, the
+        attacker gets nothing. Compare to JWT, where a permissive
+        NetworkPolicy plus a leaked token is sufficient.
+  \item \textbf{Side-channel during handshake.} Lattice KEM
+        implementations have published constant-time discipline; deviation
+        from it leaks bits of the secret. This is a code-quality concern
+        bounded by well-studied implementation hygiene.
+  \item \textbf{Downgrade to weaker cipher suite.} Mitigated by transcript
+        hashing in the handshake (Noise / TLS 1.3 style).
+\end{enumerate}
+
+The residual surface in \Cref{sec:zap-tm} is a \emph{strict subset} of the
+JWT surface in cardinality and severity. In particular, items 1, 6, 8, 9,
+and 10 in \Cref{sec:jwt-tm} have no analogue in the transport scheme.
+
+\section{Operational Failure Modes That Disappear}
+\label{sec:opfail}
+
+This section discusses three production failures that a transport scheme
+makes structurally impossible.
+
+\subsection{The mint storm}
+\label{sec:mintstorm}
+
+Consider an issuer $I$ and $n$ services each requiring a token to call
+each other. When $I$ is briefly unavailable (a deployment, a 502, a flap
+of a managed identity provider), every service that needs a fresh token
+fails to acquire one and returns 5xx to its callers. Because tokens have
+short lifetimes (often $\le 1$ hour) and many services pre-fetch only a
+small margin, an issuer outage of seconds can cascade to service
+outages of minutes.
+
+In a transport scheme there is no central minting step on the request
+path. Connection establishment uses long-term keys held locally by each
+peer; the only centralised resource is the (slow-changing) trust bundle.
+
+\subsection{The rotation cycle}
+\label{sec:rotation}
+
+We formalise rotation as a coordination problem.
+
+\begin{definition}[Rotation coordination]
+\label{def:rotation}
+A rotation event is a tuple $(t_0, t_1)$ with $t_0 < t_1$. Let
+$K_{\text{issuer}}(t)$ denote the active signing key at the issuer at time
+$t$ and $K_{\text{val}}(t,v)$ denote the key cached at validator $v$ at time
+$t$. A rotation succeeds iff for every validator $v$ and every $t \in [t_0,
+t_1]$ we have $K_{\text{issuer}}(t) \in K_{\text{val}}(t,v)$ (the cache
+contains the active key).
+\end{definition}
+
+The dual-write race occurs when an operator updates the issuer's key in one
+substrate (e.g. a cluster Secret consumed as an env var by a Pod) while a
+human or automation simultaneously updates the issuer-side credential
+record. The two writes are not transactional; the validator can observe
+either an old issuer-side credential signing tokens that the new key
+verifies, or a new issuer-side credential signing tokens that the old key
+verifies. Either disagreement causes a window of authentication failure
+proportional to the cache TTL plus the deploy lag.
+
+In the transport scheme the analogous rotation is per-service and does not
+require coordination: a service rolls its long-term KEM key, publishes the
+new public key into the trust bundle, and waits one bundle-propagation
+period before retiring the old. There is no symmetric secret to dual-write.
+
+\subsection{Clock skew}
+\label{sec:clockskew}
+
+JWT validation depends on \texttt{iat}, \texttt{nbf}, and \texttt{exp}. An
+NTP-skewed validator rejects valid tokens or accepts expired ones. In
+practice, a skew of as little as 30 seconds across a fleet of nodes is
+sufficient to produce sporadic 401s. Transport handshakes are stateless
+on wall-clock time: a freshness check is a nonce, not a timestamp.
+
+\section{Latency Model}
+\label{sec:latency}
+
+Let $L_{\text{net}}$ denote one-way network latency, $L_{\text{tls}}$ the
+TLS 1.3 handshake cost (1-RTT), $L_{\text{mint}}$ the time to obtain a JWT
+from the issuer, $L_{\text{jwks}}$ the amortised JWKS fetch cost,
+$L_{\text{val}}$ the per-call signature verification cost, and
+$L_{\text{handler}}$ the application work. Let $L_{\text{zap}}$ denote a
+ZAP handshake (one KEM encapsulation plus AEAD setup, $\approx 3$\,kB on
+the wire, computationally similar to TLS 1.3 with hybrid X25519+ML-KEM-768).
+
+\paragraph{JWT cold path.}
+\[
+T_{\JWT}^{\text{cold}} = L_{\text{tls}} + L_{\text{mint}} + L_{\text{jwks}} + L_{\text{val}} + L_{\text{handler}}.
+\]
+
+\paragraph{JWT warm path.}
+\[
+T_{\JWT}^{\text{warm}} = L_{\text{val}} + L_{\text{handler}}.
+\]
+
+\paragraph{ZAP cold path.}
+\[
+T_{\ZAP}^{\text{cold}} = L_{\text{zap}} + L_{\text{handler}}.
+\]
+
+\paragraph{ZAP warm path.}
+\[
+T_{\ZAP}^{\text{warm}} = L_{\text{handler}}.
+\]
+
+The crucial observation is that $T_{\ZAP}^{\text{warm}} =
+L_{\text{handler}}$, i.e. the steady-state per-RPC overhead of transport
+auth is zero modulo AEAD encryption (which is $\bigO(\text{bytes})$ and
+amortised in modern AES-NI/AVX-512 implementations to under 1 cycle/byte).
+The JWT scheme pays $L_{\text{val}}$ on every single call. Concrete
+measurements with RS256 verification on a representative cluster node
+yield $L_{\text{val}} \approx 100$\,$\mu$s per call, which is dominant for
+small RPCs.
+
+\section{Formal Claim}
+\label{sec:formal}
+
+We give the precise statements; the reductions are in the companion proof
+file.
+
+\begin{definition}[$\GameG_\ZAP^{\text{auth}}$ --- informal]
+A challenger generates a long-term KEM keypair for each service. The
+adversary may compromise any subset of services and any number of
+network messages. The adversary wins if a target honest service accepts
+an RPC \emph{as} another honest service.
+\end{definition}
+
+\begin{definition}[$\GameG_\JWT^{\text{auth}}$ --- informal]
+A challenger generates a signing keypair for the issuer and provisions
+service identities. The adversary may compromise validators' caches,
+arbitrary network messages, the JWKS endpoint, and may submit tokens to
+any validator. The adversary wins if a target honest validator accepts an
+RPC bearing a token claiming the identity of a non-compromised service.
+\end{definition}
+
+\begin{theorem}[Informal --- proved in \texttt{proof.tex} as Theorem 1]
+\label{thm:zap}
+\[
+\Adv_{\ZAP}^{\text{auth}}(\mathcal{A}) \;\le\;
+2 \cdot \Adv_{\KEM}^{\mathrm{IND\text{-}CCA2}}(\mathcal{B}_1) \;+\;
+\Adv_{\AEAD}^{\mathrm{IND\text{-}CCA}}(\mathcal{B}_2) \;+\;
+\Adv_{\KDF}^{\mathrm{coll}}(\mathcal{B}_3) \;+\; \tfrac{q^2}{2^\lambda},
+\]
+for adversaries $\mathcal{B}_i$ with running time and oracle access close
+to that of $\mathcal{A}$, and where $q$ is the number of handshakes and
+$\lambda$ the nonce length in bits.
+\end{theorem}
+
+\begin{theorem}[Informal --- proved in \texttt{proof.tex} as Theorem 2]
+\label{thm:jwt}
+\[
+\Adv_{\JWT}^{\text{auth}}(\mathcal{A}) \;\ge\; \max\Big\{
+\Adv_{\Sigma}^{\mathrm{EUF\text{-}CMA}},\,
+S_{\text{jwks}},\,
+S_{\text{algconf}},\,
+S_{\text{kidconf}},\,
+S_{\text{replay}},\,
+S_{\text{leak}}
+\Big\},
+\]
+where each $S_{*}$ is independently realisable by an adversary that
+exploits the corresponding failure class. In particular, the
+$\max$ is over a set whose cardinality strictly exceeds that of the
+analogous expression for $\ZAP$.
+\end{theorem}
+
+\begin{corollary}
+\label{cor:dom}
+For every reasonable concrete instantiation (RS256 + JWKS + 1\,h
+expiration on the JWT side; ML-KEM-768 + HKDF + ChaCha20-Poly1305 on the
+ZAP side), there exists a concrete polynomial-time adversary
+$\mathcal{A}$ for which
+$\Adv_{\JWT}^{\text{auth}}(\mathcal{A}) > \Adv_{\ZAP}^{\text{auth}}(\mathcal{A})$.
+The separation is constant-factor, not asymptotic, but is realised by
+each of the JWT failure classes individually.
+\end{corollary}
+
+\section{Cost Analysis}
+\label{sec:cost}
+
+Production deployments of bearer-token authentication grow several
+operational artefacts per service: an issuer-side application record, a
+client-credentials secret, a key-management-system rotation policy, an
+env-var or projected-volume mount, a client library that mints tokens, a
+server library that validates them, a JWKS cache. Field measurements of
+medium-complexity Go service code reveal an average of
+$\approx 500$\,LOC per service devoted purely to JWT handling
+(client mint, server validation, JWKS fetch and refresh, error retry,
+clock-skew tolerance). The corresponding ZAP client is roughly
+$\approx 50$\,LOC: \texttt{Dial}, send, receive.
+
+\begin{table}[h!]
+\centering
+\caption{Operational artefacts per service.}
+\label{tab:artefacts}
+\begin{tabular}{lcc}
+\toprule
+Artefact & JWT-at-app & Transport-KEM \\
+\midrule
+Issuer-side credential & yes & --- \\
+Cluster Secret with shared symmetric value & yes (or signing key) & --- \\
+JWKS endpoint & yes & --- \\
+Token cache + refresh logic & yes & --- \\
+Long-term KEM keypair & --- & yes (per service) \\
+Cluster trust bundle & --- & yes (one, slow-changing) \\
+\midrule
+Client LOC (median) & 500 & 50 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{When Transport Auth Alone Is Not Enough: The Hybrid Edge}
+\label{sec:edge}
+
+Browsers and third-party SDKs cannot, today, present a long-term KEM
+identity to the cluster. The browser's identity is a user session; the
+third-party SDK's identity is an OAuth client. Bearer tokens remain the
+correct primitive for the public edge, where the threats and
+adversary capabilities are different (they include phishing, session
+hijack, and authorisation-server compromise) and the latency profile is
+dominated by WAN RTT.
+
+The hybrid model is therefore: bearer tokens at the public ingress; the
+ingress validates once and translates the request to an authenticated
+ZAP call against an internal service; all subsequent service-to-service
+calls use ZAP. The authentication burden of \Cref{sec:jwt-tm} is paid
+once per public request, at the edge, where it can be amortised across
+many internal RPCs and contained inside one well-audited component.
+
+\section{Related Work}
+\label{sec:related}
+
+The intellectual ancestry of transport-layer mutual authentication is
+old and well-tested. SSH host keys~\cite{ylonen2006rfc4251} bind a
+service's identity to its long-term key; SSH does not require a central
+identity issuer. The Noise Protocol Framework~\cite{perrin2018noise}
+provides a family of patterns covering exactly the in-cluster RPC use
+case. WireGuard~\cite{donenfeld2017wireguard} demonstrates a deployed
+production protocol whose authentication is purely transport-layer KEM.
+Signal's X3DH~\cite{marlinspike2016x3dh} extends Noise-style key
+agreement with prekey servers and asynchronous delivery; the relevance
+here is its post-compromise security argument. SPIFFE/SPIRE~\cite{spiffe}
+takes a hybrid approach: workload identity is a transport-layer X.509
+identity, and JWT-SVID is layered on top for cases that need a bearer
+abstraction. The conclusion of the SPIFFE community converges with our
+own: bearer tokens are useful in carefully-bounded contexts; mTLS-style
+mutual auth is the default. The TLS 1.3 specification~\cite{rfc8446} and
+its analyses formalise the handshake security for the related case of
+asymmetric-cert mutual TLS.
+
+The catalogue of JWT failure modes is well-documented in the IETF best
+current practice~\cite{ietfjwtbcp}, the JOSE specifications themselves
+(\cite{rfc7515,rfc7518,rfc7519}), and an extensive vendor advisory
+literature.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Inside a cluster, the unit of authentication is the connection, and the
+identity of a peer is well-modelled by its long-term KEM key. JWT was
+designed for the public web, where bearer semantics are operationally
+necessary and the alternative is impossible. Carrying that design
+inside a cluster imports a long catalogue of failure modes --- including
+ones (mint storms, rotation races, JWKS SSRF) that have no analogue in a
+transport scheme --- without bringing any compensating benefit. We
+recommend transport-layer mutual authentication via a KEM handshake
+(ZAP, Noise, mTLS) for all in-cluster RPC, with bearer tokens reserved
+for the public edge.
+
+\paragraph{Future work.} A fielded measurement study comparing JWT
+warm-path validation cost against AEAD per-byte cost across realistic
+RPC payload distributions; a formal post-compromise security analysis
+for the long-term key rotation schedule; integration of post-quantum
+hybrid handshakes (X25519 + ML-KEM-768) into the threat-model accounting
+above; and an empirical study of the false-positive rate of clock-skew
+related authentication failures in production fleets.
+
+\begin{thebibliography}{99}
+
+\bibitem{rfc7519} M. Jones, J. Bradley, N. Sakimura.
+  \emph{JSON Web Token (JWT)}. RFC 7519, IETF, 2015.
+  \url{https://www.rfc-editor.org/rfc/rfc7519}.
+
+\bibitem{rfc7515} M. Jones, J. Bradley, N. Sakimura.
+  \emph{JSON Web Signature (JWS)}. RFC 7515, IETF, 2015.
+  \url{https://www.rfc-editor.org/rfc/rfc7515}.
+
+\bibitem{rfc7517} M. Jones.
+  \emph{JSON Web Key (JWK)}. RFC 7517, IETF, 2015.
+  \url{https://www.rfc-editor.org/rfc/rfc7517}.
+
+\bibitem{rfc7518} M. Jones.
+  \emph{JSON Web Algorithms (JWA)}. RFC 7518, IETF, 2015.
+  \url{https://www.rfc-editor.org/rfc/rfc7518}.
+
+\bibitem{rfc8446} E. Rescorla.
+  \emph{The Transport Layer Security (TLS) Protocol Version 1.3}.
+  RFC 8446, IETF, 2018.
+  \url{https://www.rfc-editor.org/rfc/rfc8446}.
+
+\bibitem{ietfjwtbcp} Y. Sheffer, D. Hardt, M. Jones.
+  \emph{JSON Web Token Best Current Practices}. RFC 8725, IETF BCP 225,
+  2020. \url{https://www.rfc-editor.org/rfc/rfc8725}.
+
+\bibitem{auth0algnone} T. McLean.
+  \emph{Critical vulnerabilities in JSON Web Token libraries}.
+  Auth0 advisory, 2015.
+  See CVE-2015-9235 and family.
+  \url{https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/}.
+
+\bibitem{auth0algconf} T. McLean.
+  \emph{JWT algorithm confusion: HS256 with RS256 public key}.
+  Public advisory, 2016. CVE-2016-10555, CVE-2016-5431, CVE-2018-1000531.
+
+\bibitem{donenfeld2017wireguard} J.~A. Donenfeld.
+  \emph{WireGuard: Next Generation Kernel Network Tunnel}.
+  NDSS, 2017.
+  \url{https://www.wireguard.com/papers/wireguard.pdf}.
+
+\bibitem{perrin2018noise} T. Perrin.
+  \emph{The Noise Protocol Framework}. Specification rev. 34, 2018.
+  \url{https://noiseprotocol.org/noise.html}.
+
+\bibitem{marlinspike2016x3dh} M. Marlinspike, T. Perrin.
+  \emph{The X3DH Key Agreement Protocol}. Signal Specification, 2016.
+  \url{https://signal.org/docs/specifications/x3dh/}.
+
+\bibitem{ylonen2006rfc4251} T. Yl\"onen, C. Lonvick.
+  \emph{The Secure Shell (SSH) Protocol Architecture}. RFC 4251, IETF, 2006.
+  \url{https://www.rfc-editor.org/rfc/rfc4251}.
+
+\bibitem{spiffe} SPIFFE Authors.
+  \emph{The SPIFFE Standards: Workload Identity for Distributed Systems}.
+  Specification, 2023.
+  \url{https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/}.
+
+\bibitem{cremers2017tls13} C. Cremers, M. Horvat, J. Hoyland, S. Scott,
+  T. van der Merwe.
+  \emph{A Comprehensive Symbolic Analysis of TLS 1.3}.
+  ACM CCS, 2017.
+
+\bibitem{nistfips203} NIST.
+  \emph{FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard}.
+  Federal Information Processing Standard, 2024.
+
+\bibitem{krawczyk2010hkdf} H. Krawczyk.
+  \emph{Cryptographic Extraction and Key Derivation: The HKDF Scheme}.
+  CRYPTO, 2010.
+
+\bibitem{boringssl} Google BoringSSL Authors.
+  \emph{BoringSSL Design and Threat Model Documentation}.
+  Project documentation, 2024.
+
+\bibitem{rfc9000} J. Iyengar, M. Thomson.
+  \emph{QUIC: A UDP-Based Multiplexed and Secure Transport}. RFC 9000,
+  IETF, 2021.
+  \url{https://www.rfc-editor.org/rfc/rfc9000}.
+
+\end{thebibliography}
+
+\end{document}

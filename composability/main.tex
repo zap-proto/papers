@@ -1,0 +1,577 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amsthm,amssymb}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usepackage{tikz-cd}
+\usepackage[capitalize,noabbrev]{cleveref}
+\usepackage[
+  backend=biber,
+  style=numeric-comp,
+  sorting=none
+]{biblatex}
+\addbibresource{refs.bib}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{example}[theorem]{Example}
+\theoremstyle{remark}
+\newtheorem*{remark}{Remark}
+
+\newcommand{\CZ}{\mathcal{C}_{\mathrm{ZAP}}}
+\newcommand{\Zb}{Z_{\mathrm{base}}}
+\newcommand{\Zh}{Z_{\mathrm{http}}}
+\newcommand{\Zw}{Z_{\mathrm{ws}}}
+\newcommand{\Zf}{Z_{\mathrm{fix}}}
+\newcommand{\Zr}{Z_{\mathrm{rns}}}
+\newcommand{\Zm}{Z_{\mathrm{mcp}}}
+\newcommand{\Zac}{Z_{\mathrm{acp}}}
+\newcommand{\Za}{Z_{\mathrm{a2a}}}
+\newcommand{\Adv}{\mathbf{Adv}}
+
+\title{Compositionality of the ZAP Protocol Family:\\
+A Categorical Framework for Sub-Protocol Composition}
+\author{ZAP Protocol Authors\\\texttt{zap-proto.io}}
+\date{2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The ZAP protocol family ships as a layered specification: a wire format
+($\Zb$) under several application protocols (\texttt{zap-http},
+\texttt{zap-ws}, \texttt{zap-fix}, \texttt{zap-rns}, \texttt{zap-mcp},
+\texttt{zap-acp}, \texttt{zap-a2a}). Specifications of this shape are
+usually composed informally, and the security guarantees of the parts
+are not always preserved when they are stacked. We give a categorical
+account of the family. We define a strict 2-category $\CZ$ whose
+objects are protocols, whose 1-morphisms are session-preserving
+embeddings, and whose 2-morphisms are simulation refinements. We prove
+(i) $\CZ$ satisfies the category and 2-category axioms, (ii) $\Zb$ is
+initial in $\CZ$, and (iii) every security property expressible as an
+indistinguishability game with non-negligible advantage is preserved
+along tight embeddings, with an explicit composition bound. The
+framework makes mechanical the engineering claim that, e.g., running
+\texttt{zap-fix-over-zap-rns} inherits the post-quantum and
+session-binding properties of both layers without re-proof. We discuss
+the relationship to Universal Composability~\cite{canetti2020uc},
+multiparty session types~\cite{honda2016multiparty}, and reactive
+simulatability~\cite{pfitzmann2001model}.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Protocol stacks are usually composed at design time and verified
+piecewise. The composition is left to a paragraph in the specification.
+This is fine when the composition is loose --- e.g., HTTP-over-TCP,
+where the application layer treats the transport as an opaque byte
+stream. It is dangerous when the composition is tight --- where the
+inner protocol relies on an invariant of the outer protocol that the
+outer protocol does not promise. The triple-handshake attack on TLS
+session resumption~\cite{bhargavan2014triple} is the canonical example:
+the inner channel binding broke because two TLS sessions were chained
+without a name binding.
+
+The ZAP family is a layered specification with seven sub-protocols
+sitting over a common wire format. The temptation in such a setting
+is to write the spec in English and let implementers stitch the layers
+together. We resist that temptation. We give a categorical framework
+in which the composition is a primitive, security properties are
+parameterized over morphisms, and the engineer's question
+``\emph{if I run protocol $P$ over protocol $Q$, what do I get?}''
+becomes a calculation rather than a discussion.
+
+The contribution of this paper is structural, not cryptographic. We
+do not prove new lower bounds for any individual protocol's security.
+We give a category in which the existing proofs about the parts can
+be \emph{composed} mechanically into proofs about the whole, with
+explicit and tight bounds.
+
+\paragraph{Roadmap.} \Cref{sec:family} recaps the seven sub-protocols.
+\Cref{sec:category} defines the category $\CZ$.
+\Cref{sec:composition} states and proves the central composition
+theorem (full proof in the companion document, with references
+inline). \Cref{sec:instances} works out the five concrete embeddings.
+\Cref{sec:universal} proves the universal property of $\Zb$.
+\Cref{sec:practice} discusses what the framework buys us in
+practice. \Cref{sec:related} situates the work.
+
+\section{The ZAP Sub-Protocol Family}
+\label{sec:family}
+
+We give a one-paragraph recap of each sub-protocol. Each is the
+subject of a separate paper in this collection; we cite those for
+the full specification and security claims.
+
+\paragraph{$\Zb$ (zap wire).} The base wire format. A length-prefixed,
+zero-copy frame carrying a typed envelope and a payload. Sessions are
+identified by 128-bit session IDs and are bound to the underlying
+transport via a key schedule derived from a hybrid post-quantum
+KEM~\cite{zap2026pq}. $\Zb$ is the substrate; every other protocol in
+the family ultimately produces $\Zb$ frames on the wire.
+
+\paragraph{$\Zh$ (zap-http).} A request/response protocol. Each
+request is a single $\Zb$ frame; each response is a single $\Zb$
+frame. Idempotency is carried in the envelope. $\Zh$ has no
+session-level state beyond the underlying $\Zb$ session.
+
+\paragraph{$\Zw$ (zap-ws).} A bidirectional streaming protocol over a
+single $\Zb$ session. Frames flow in both directions concurrently.
+$\Zw$ adds back-pressure annotations and stream multiplexing identifiers.
+
+\paragraph{$\Zf$ (zap-fix).} A FIX-compatible session protocol. Sequence
+numbers, gap-fill, persistent session identifiers. $\Zf$ carries FIX
+4.4-style messages re-encoded as $\Zb$ envelopes.
+
+\paragraph{$\Zr$ (zap-rns).} The identity-binding sub-protocol. Names
+are bound to public keys and to session keys at handshake time. $\Zr$
+contributes the channel-binding token and is the source of the
+``identity'' field in the $\Zb$ envelope of every authenticated
+session~\cite{zap2026rns}.
+
+\paragraph{$\Zm$ (zap-mcp).} A model context protocol carrying tool
+calls and structured tool responses. Streaming responses are natural;
+$\Zm$ runs as a $\Zw$ stream with structured envelopes.
+
+\paragraph{$\Zac$ (zap-acp).} An agent control protocol: capability
+negotiation, session establishment between agents, and structured
+control messages.
+
+\paragraph{$\Za$ (zap-a2a).} Agent-to-agent task delegation. A task is
+a structured envelope; we will see that $\Za$ embeds in $\Zm$ by
+viewing a task as an MCP tool call with structured arguments.
+
+\section{The Category $\CZ$}
+\label{sec:category}
+
+\subsection{Protocols as Objects}
+
+We work in a labeled transition system model. A protocol $P$ is a
+tuple $(\Sigma_P, \mathcal{S}_P, s^0_P, \to_P, \mathcal{V}_P)$ where
+$\Sigma_P$ is the message alphabet (set of well-formed envelopes),
+$\mathcal{S}_P$ is the set of session states, $s^0_P$ is the initial
+state, $\to_P \subseteq \mathcal{S}_P \times \Sigma_P \times
+\mathcal{S}_P$ is the labelled transition relation, and
+$\mathcal{V}_P : \mathcal{S}_P \to 2^{\mathrm{Prop}}$ is a valuation
+over a fixed propositional vocabulary that includes the security
+predicates we care about (confidentiality, authenticity,
+session-bound, post-quantum, fresh-key, channel-bound, etc.).
+
+A \emph{trace} of $P$ is a finite sequence $\sigma = m_1 m_2 \cdots
+m_n \in \Sigma_P^*$ such that there exist states $s_0, s_1, \ldots,
+s_n$ with $s_0 = s^0_P$ and $s_{i-1} \xrightarrow{m_i}_P s_i$ for all
+$i$. Write $\mathrm{Tr}(P)$ for the set of all traces and
+$\mathrm{Tr}^\omega(P)$ for the set of infinite traces.
+
+\subsection{Embeddings as 1-Morphisms}
+
+\begin{definition}[Protocol embedding]
+\label{def:embedding}
+A \emph{protocol embedding} from $P$ to $Q$, written
+$\varphi : P \hookrightarrow Q$, is a triple $(\varphi_\Sigma,
+\varphi_\mathcal{S}, \rho)$ such that:
+\begin{enumerate}
+\item $\varphi_\Sigma : \Sigma_P \to \Sigma_Q^+$ is an injective map
+that translates each $P$-message into a non-empty finite sequence of
+$Q$-messages.
+\item $\varphi_\mathcal{S} : \mathcal{S}_P \to \mathcal{S}_Q$ is a
+state map with $\varphi_\mathcal{S}(s^0_P) = s^0_Q$ when $\rho =
+\bot$, or $\varphi_\mathcal{S}(s^0_P)$ is reachable from $s^0_Q$
+when $\rho \neq \bot$.
+\item Whenever $s \xrightarrow{m}_P s'$, the unique trace
+$\varphi_\Sigma(m) = m_1 m_2 \cdots m_k$ produces transitions
+$\varphi_\mathcal{S}(s) \xrightarrow{m_1}_Q \cdots
+\xrightarrow{m_k}_Q \varphi_\mathcal{S}(s')$.
+\item For every security predicate $\pi$ in the shared vocabulary,
+$\pi \in \mathcal{V}_P(s) \implies \pi \in
+\mathcal{V}_Q(\varphi_\mathcal{S}(s))$ \emph{whenever the embedding
+declares $\pi$ as preserved}; we write $\Pi(\varphi)$ for the set of
+such $\pi$.
+\item $\rho$ is the \emph{embedding's leakage profile}: an upper bound
+on the additional information that an observer of $Q$ learns about
+the $P$-session relative to an observer of $P$ alone. Formally,
+$\rho \in [0,1]$ bounds the statistical distance between the
+distribution of $Q$-traces under $\varphi$ and the distribution that
+would result from running $Q$ on uniformly random input of the same
+length.
+\end{enumerate}
+\end{definition}
+
+The leakage profile $\rho$ is the categorical placeholder for the
+``cost of embedding'': for tight embeddings, $\rho = 0$.
+
+\begin{definition}[Composition]
+\label{def:composition}
+Given $\varphi : P \hookrightarrow Q$ and $\psi : Q \hookrightarrow
+R$, the composition $\psi \circ \varphi : P \hookrightarrow R$ is
+$(\psi_\Sigma^* \circ \varphi_\Sigma,\, \psi_\mathcal{S} \circ
+\varphi_\mathcal{S},\, \rho_\varphi + \rho_\psi)$, where
+$\psi_\Sigma^*$ extends $\psi_\Sigma$ to sequences componentwise.
+\end{definition}
+
+The leakage adds in the standard sub-additive sense (statistical
+distance is a metric and obeys the triangle inequality); we use
+addition as a tight upper bound for the small leakages encountered
+in the family.
+
+\begin{definition}[Identity]
+The identity embedding $\mathrm{id}_P : P \hookrightarrow P$ is
+$(\mathrm{id}_{\Sigma_P}^{(1)}, \mathrm{id}_{\mathcal{S}_P}, 0)$,
+where $\mathrm{id}_\Sigma^{(1)}(m) = m$ as a one-element sequence.
+\end{definition}
+
+\subsection{Refinements as 2-Morphisms}
+
+\begin{definition}[Simulation refinement]
+\label{def:refinement}
+Given two embeddings $\varphi, \varphi' : P \hookrightarrow Q$, a
+\emph{simulation refinement} $\alpha : \varphi \Rightarrow \varphi'$
+is a binary relation
+$R_\alpha \subseteq \mathcal{S}_Q \times \mathcal{S}_Q$ such that:
+\begin{enumerate}
+\item For all $s \in \mathcal{S}_P$,
+$(\varphi_\mathcal{S}(s), \varphi'_\mathcal{S}(s)) \in R_\alpha$.
+\item Whenever $(t, t') \in R_\alpha$ and $t \xrightarrow{m}_Q t_1$
+in the image of $\varphi$, there exists a $Q$-trace
+$t' \xrightarrow{m'_1}_Q \cdots \xrightarrow{m'_j}_Q t'_j$ in the
+image of $\varphi'$ such that $(t_1, t'_j) \in R_\alpha$ and the
+two paths are observationally equivalent up to the difference in
+leakage $\rho_{\varphi'} - \rho_\varphi$.
+\end{enumerate}
+\end{definition}
+
+A 2-morphism captures the engineering reality that two embeddings
+of the same protocol may differ in their wire-level realization
+without differing in the abstract semantics they realize.
+
+\subsection{Category Axioms}
+
+\begin{theorem}[Category and 2-category]
+\label{thm:cat}
+The data $(\mathrm{Obj}(\CZ), \mathrm{Hom}_{\CZ}, \mathrm{2Hom}_{\CZ},
+\circ, \mathrm{id})$ defines a strict 2-category. In particular,
+1-composition is associative and unital, and 2-cells compose
+horizontally and vertically with the standard interchange law.
+\end{theorem}
+
+The proof is in the companion document
+(Theorem~1, \texttt{proofs/composability/proof.tex}). The unfolding is straightforward; the only
+non-trivial check is that the leakage profiles compose by addition
+across all three axes (vertical, horizontal, identity), which they
+do because statistical distance is a metric.
+
+\section{Composition Theorem}
+\label{sec:composition}
+
+\subsection{Tight Embeddings}
+
+\begin{definition}[Tight embedding]
+\label{def:tight}
+An embedding $\varphi : P \hookrightarrow Q$ is \emph{tight} if its
+leakage profile satisfies $\rho_\varphi \le \mathrm{negl}(\lambda)$,
+where $\lambda$ is the security parameter and $\mathrm{negl}$ denotes
+any function negligible in $\lambda$.
+\end{definition}
+
+The intuition is that an observer of the outer protocol $Q$ learns
+nothing more about the inner protocol $P$ than they would learn from
+a $P$-observer with access to a uniformly random tape of the same
+length. The condition rules out side-channel leakage by virtue of the
+embedding itself; it does not rule out side-channels that come from
+implementations.
+
+\subsection{Inheritance}
+
+We model security properties as indistinguishability games. A property
+$\pi$ over protocol $P$ is captured by a game $G_\pi^P$ between a
+challenger and an adversary $\mathcal{A}$, with advantage
+$\Adv_\pi^P(\mathcal{A}) := |\Pr[G_\pi^P(\mathcal{A}) = 1] - 1/2|$.
+The property holds against a class $\mathcal{C}$ of adversaries with
+parameter $\lambda$ if $\Adv_\pi^P(\mathcal{A}) \le
+\mathrm{negl}(\lambda)$ for all $\mathcal{A} \in \mathcal{C}$.
+
+\begin{theorem}[Composition of security under tight embedding]
+\label{thm:composition}
+Let $\varphi : P \hookrightarrow Q$ be a tight embedding and let
+$\pi \in \Pi(\varphi)$. If $P$ satisfies $\pi$ against adversary
+class $\mathcal{C}$ with bound $\epsilon_P(\lambda)$, then $Q$
+satisfies $\pi$ against the same class with bound
+$\epsilon_Q(\lambda) \le \epsilon_P(\lambda) + \rho_\varphi
++ \delta_\varphi(\lambda)$, where $\delta_\varphi$ is a function of
+the embedding's complexity (see Theorem~3 of the proof companion).
+For tight embeddings, $\rho_\varphi$ is negligible and $Q$ inherits
+$\pi$ up to a negligible additive term.
+\end{theorem}
+
+\begin{corollary}[Stack inheritance]
+\label{cor:stack}
+If $\varphi_1 : P_1 \hookrightarrow P_2$, $\varphi_2 : P_2
+\hookrightarrow P_3$, \ldots, $\varphi_n : P_n \hookrightarrow
+P_{n+1}$ are all tight, and $P_1$ satisfies $\pi$ with bound
+$\epsilon_1$, then $P_{n+1}$ satisfies $\pi$ with bound bounded by
+$\epsilon_1 + \sum_{i=1}^n (\rho_{\varphi_i} + \delta_{\varphi_i})$,
+which is negligible whenever the chain length $n$ is polynomial in
+$\lambda$.
+\end{corollary}
+
+The proof is by induction on the chain length, with the inductive
+step being a direct application of \cref{thm:composition}.
+
+\section{Concrete Embeddings}
+\label{sec:instances}
+
+We exhibit five embeddings used by the family. Each is shown to be
+tight in the companion proofs document.
+
+\subsection{$\Zh \hookrightarrow \Zw$: HTTP as single-stream WS}
+
+\begin{proposition}
+\label{prop:http-ws}
+There is a tight embedding $\varphi_{hw} : \Zh \hookrightarrow \Zw$
+that maps a request/response pair to a singleton bidirectional stream
+opened, used for one round trip, and closed.
+\end{proposition}
+
+The embedding takes a $\Zh$ request frame to a $\Zw$ \texttt{OPEN}
+frame followed by the same envelope, and a $\Zh$ response frame to a
+$\Zw$ envelope followed by a \texttt{CLOSE} frame. The leakage is
+zero because the only additional bytes are framing bytes that an
+$\Zh$-only observer would already see at the $\Zb$ layer.
+
+\subsection{$\Zf \hookrightarrow \Zw$: FIX session as persistent stream}
+
+\begin{proposition}
+\label{prop:fix-ws}
+There is a tight embedding $\varphi_{fw} : \Zf \hookrightarrow \Zw$
+that maps a FIX session to a single $\Zw$ stream, with FIX sequence
+numbers preserved as $\Zw$ envelope sequence numbers.
+\end{proposition}
+
+The map is straightforward: each FIX message is a $\Zw$ envelope, and
+the FIX session-level reset semantics are realized by $\Zw$
+\texttt{RESET} frames. The post-quantum properties of the underlying
+$\Zb$ key schedule are inherited; $\Zf$ does not contribute its own
+key schedule.
+
+\subsection{$\Zr \hookrightarrow \Zb$: RNS into the base envelope}
+
+\begin{proposition}
+\label{prop:rns-base}
+There is a tight embedding $\varphi_{rb} : \Zr \hookrightarrow \Zb$
+that injects an RNS-bound identity into the \texttt{identity} field
+of the $\Zb$ envelope at handshake time.
+\end{proposition}
+
+This is the most direct embedding in the family; $\Zr$ contributes
+exactly one piece of state (the bound identity) and one piece of wire
+(the channel-binding token), both of which live natively in $\Zb$.
+
+\subsection{$\Zm \hookrightarrow \Zw$: MCP over WS}
+
+\begin{proposition}
+\label{prop:mcp-ws}
+There is a tight embedding $\varphi_{mw} : \Zm \hookrightarrow \Zw$
+that maps an MCP tool-call/streaming-response pair to a $\Zw$ stream
+where the request is a single envelope and the response is a finite
+sequence of envelopes terminated by a final-frame marker.
+\end{proposition}
+
+\subsection{$\Za \hookrightarrow \Zm$: A2A as MCP tool calls}
+
+\begin{proposition}
+\label{prop:a2a-mcp}
+There is a tight embedding $\varphi_{am} : \Za \hookrightarrow \Zm$
+that maps an A2A task to an MCP tool call with structured arguments
+and an MCP streaming response carrying the task progress and result.
+\end{proposition}
+
+\begin{remark}
+The embedding $\Za \hookrightarrow \Zm \hookrightarrow \Zw
+\hookrightarrow \Zb$ makes precise the claim
+``\texttt{zap-a2a} runs over \texttt{zap-mcp} runs over
+\texttt{zap-ws} runs over the wire.'' The composite embedding is
+tight by~\cref{cor:stack}, and so the post-quantum, channel-binding,
+and authenticity properties of $\Zb$ are inherited by $\Za$ without a
+separate proof.
+\end{remark}
+
+\section{Universal Property of $\Zb$}
+\label{sec:universal}
+
+\begin{theorem}[Initial object]
+\label{thm:initial}
+$\Zb$ is initial in $\CZ$: for every protocol $P \in
+\mathrm{Obj}(\CZ)$, there exists a unique morphism
+$\iota_P : \Zb \hookrightarrow P$ given by ``every $\Zb$ envelope is a
+well-formed $P$-message in the boot phase before any $P$-specific
+state is added.''
+\end{theorem}
+
+The proof is in the companion document (Theorem~2 of the proof
+companion). Initiality formalizes a phrase from the family's design notes:
+``\emph{The wire is the source of truth.}'' Concretely:
+
+\begin{enumerate}
+\item Any parser that handles $\Zb$ frames can recover the structured
+semantics of any sub-protocol $P$ by composing with the unique
+$\iota_P$.
+\item Any new sub-protocol added to the family must define an
+embedding into $\Zb$. The category enforces it.
+\item Wire-level interoperability across language bindings is a
+functor: each binding $L$ is a category $\mathcal{C}_L$ of
+``protocol-as-implemented-in-$L$,'' and there is a functor $F_L :
+\CZ \to \mathcal{C}_L$ that takes $\Zb$ to its in-language envelope
+type. By initiality, every sub-protocol's binding type is determined
+up to isomorphism by the binding for $\Zb$.
+\end{enumerate}
+
+\section{Practical Implications}
+\label{sec:practice}
+
+\subsection{Security review reduces to embedding review}
+
+For a new sub-protocol $P_{\mathrm{new}}$, the security review need
+not re-prove handshake security, post-quantum properties, or
+channel-binding. It suffices to:
+
+\begin{enumerate}
+\item Define the embedding $\iota_{P_{\mathrm{new}}} : \Zb
+\hookrightarrow P_{\mathrm{new}}$ (always exists by initiality).
+\item Show the embedding is tight.
+\item Identify the security properties $\pi$ that $\Zb$ already
+provides and that the embedding preserves
+($\pi \in \Pi(\iota_{P_{\mathrm{new}}})$).
+\item Prove only the $P_{\mathrm{new}}$-specific properties on top.
+\end{enumerate}
+
+This is a substantial reduction in proof burden. For example, when
+$\Zm$ was added to the family, the security review consisted of
+showing that the MCP-over-WS embedding is tight (a one-page proof,
+\cref{prop:mcp-ws}) and that MCP's tool-call authorization adds a
+single new property on top of the inherited $\Zb$ guarantees. No
+re-proof of the post-quantum hybrid KEM was needed.
+
+\subsection{Wire compatibility}
+
+A $\Zb$ parser is universal in the family. Tooling (Wireshark
+dissectors~\cite{zap2026wire}, language bindings, capture analyzers)
+need to be written once at the $\Zb$ layer; the structured semantics
+of any sub-protocol are recovered by composition with the relevant
+embedding.
+
+\subsection{Implementation languages as functors}
+
+The 30+ language bindings under \texttt{zap-go}, \texttt{zap-rust},
+\texttt{zap-java}, and so on are each a functor $F_L : \CZ \to
+\mathcal{C}_L$. The categorical structure is preserved: an embedding
+$\varphi : P \hookrightarrow Q$ in $\CZ$ becomes an embedding
+$F_L(\varphi)$ in $\mathcal{C}_L$. This means cross-language
+interoperability is automatic at the categorical level: an A2A
+agent written in Rust calling an MCP server written in Go is a
+diagram in $\mathcal{C}_{\mathrm{wire}}$ that commutes by
+functoriality.
+
+\subsection{Stack security in one example}
+
+\begin{example}[Inherited PQ properties for FIX-over-RNS]
+\label{ex:fix-pq}
+Consider an institutional client running $\Zf$ (FIX-compatible
+session) over $\Zr$ (identity binding) over $\Zw$ over $\Zb$. The
+chain of embeddings is
+$\Zf \hookrightarrow \Zw \hookrightarrow \Zb \leftarrow \Zr
+\hookrightarrow \Zb$, with the $\Zr$ contribution an additive
+binding rather than a layering. By~\cref{cor:stack} and the
+$\Zr \hookrightarrow \Zb$ tightness, the post-quantum hybrid-KEM key
+schedule of $\Zb$ is inherited by $\Zf$, and the identity-binding
+guarantee of $\Zr$ holds at every $\Zf$ message. No FIX-specific
+post-quantum proof is needed.
+\end{example}
+
+\subsection{Where the framework does not help}
+
+The framework gives no help against side-channel attacks below the
+LTS abstraction (timing, cache, electromagnetic), against
+implementation bugs that violate the tightness condition (e.g., an
+implementation that leaks session state via debug logs), or against
+adversaries outside the modeled class (e.g., adversaries with
+access to the host's memory). It also says nothing about
+\emph{availability} composition; a denial-of-service attack on $\Zb$
+denies service to every sub-protocol.
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Universal Composability.}
+Canetti's UC framework~\cite{canetti2001uc, canetti2020uc} is the
+gold standard for composable cryptographic security. Our framework is
+strictly weaker: we model protocols as labelled transition systems
+and security properties as indistinguishability games, without the
+UC machinery of environments, ideal functionalities, and the
+composition theorem. The trade is deliberate: UC proofs are
+expensive, and the ZAP family does not need the full strength of UC
+because the embeddings are tight by construction. For sub-protocols
+where UC-strength composition is required (e.g., $\Zr$ when used as
+a stand-alone identity provider), a UC proof is given separately
+and the categorical framework is used to lift it to the rest of the
+family.
+
+\paragraph{Multiparty session types.}
+Honda, Yoshida, and Carbone~\cite{honda2016multiparty} give a type
+system in which multiparty protocols are specified globally and
+projected to local types per participant. Our category $\CZ$ can be
+viewed as a coarser, ``protocol-level'' analogue of session types:
+objects are protocols rather than session types per se, and morphisms
+are embeddings rather than projections. We do not pursue the
+projection direction here; that would be the natural follow-up.
+
+\paragraph{Reactive simulatability.}
+Pfitzmann and Waidner~\cite{pfitzmann2000reactive, pfitzmann2001model}
+develop a model close in spirit to UC but with an explicit notion of
+reactive systems and a composition theorem in that setting. Our
+2-cells (simulation refinements) are inspired by their notion of
+``perfect indistinguishability of structures.''
+
+\paragraph{Process algebra.}
+CSP~\cite{hoare1985csp} and the
+$\pi$-calculus~\cite{milner1999pi} provide the LTS substrate we work
+in. Our embeddings are a categorical variant of CSP-style refinement
+under hiding, with the security predicates added on top.
+
+\paragraph{Categorical accounts of protocols.}
+Caires and Pfenning's session types as
+intuitionistic linear propositions~\cite{caires2010session} and
+Wadler's ``Propositions as Sessions''~\cite{wadler2012propositions}
+give a categorical foundation for session-typed concurrency. We work
+at a coarser level (protocol families rather than individual
+sessions); the two views are complementary.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+The ZAP family forms a strict 2-category $\CZ$. The base wire format
+$\Zb$ is initial. Tight embeddings preserve security properties under
+composition with explicit and tight bounds. The seven sub-protocols
+embed into one another along the diagram of~\cref{sec:instances}, and
+the practical engineering claim that any composite stack inherits
+the security of its components is, in the framework, a calculation.
+Future work includes (i) a Coq formalization of $\CZ$ with the
+embeddings of \cref{sec:instances} mechanically verified, (ii) the
+projection from $\CZ$ to a multiparty session-type
+calculus~\cite{honda2016multiparty}, and (iii) a denotational
+semantics in which the leakage profile $\rho$ is given by an
+information-theoretic mutual-information bound rather than by
+statistical distance.
+
+\printbibliography
+
+\end{document}

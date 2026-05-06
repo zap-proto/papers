@@ -1,0 +1,369 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{enumitem}
+
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{proposition}[theorem]{Proposition}
+
+\title{ZAP-WS: Per-Stream Independent Flow Control with\\
+Tail-Latency Guarantees and Post-Quantum Confidentiality}
+
+\author{ZAP Protocol Authors\\
+\texttt{zap-proto.io}}
+
+\date{2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present ZAP-WS, a streaming and publish/subscribe layer over the ZAP transport
+protocol that provides multiple independent logical streams over a single ZAP
+connection. Unlike WebSocket (RFC 6455) and HTTP/2 (RFC 9113), which both
+multiplex streams over a single TCP byte-stream and therefore inherit
+TCP-level head-of-line (HoL) blocking on packet loss, ZAP-WS gives each
+stream its own sequence number space, frame-level optional forward error
+correction (FEC), and per-stream credit-based backpressure. The result is a
+tail-latency profile in which the arrival latency of stream $s_i$ is
+statistically independent of frames in stream $s_j$ for $j \ne i$. ZAP-WS
+matches the head-of-line blocking elimination of HTTP/3 (RFC 9114) over
+QUIC, while retaining mutual authentication and post-quantum
+confidentiality from the underlying ZAP handshake. We formalize the
+tail-latency claim and prove it under standard packet loss models. We
+discuss when ZAP-WS is materially better than HTTP/3 (post-quantum
+deployments, embedded environments without QUIC, scenarios requiring
+deterministic FEC instead of retransmission).
+\end{abstract}
+
+\section{Introduction}
+
+Modern application traffic is dominated by long-lived streaming patterns:
+chat, market data, telemetry, live updates, agent-to-agent coordination,
+log shipping, and progressive AI inference. The transport options
+historically available to application developers are constrained:
+
+\begin{itemize}
+\item \textbf{Server-Sent Events (SSE)} -- unidirectional (server $\to$
+client), text-only, single stream per HTTP connection.
+\item \textbf{WebSocket (RFC 6455)} \cite{rfc6455} -- full-duplex, but a
+single ordered byte stream per TCP connection. Application-level
+multiplexing requires explicit framing and forfeits any independence
+guarantee.
+\item \textbf{HTTP/2 (RFC 9113)} \cite{rfc9113} -- multi-stream
+multiplexing over a single TCP connection. The streams share TLS and TCP
+state; a single packet loss blocks delivery of \emph{all} streams until
+retransmission, even though the streams are logically independent.
+\item \textbf{HTTP/3 (RFC 9114)} \cite{rfc9114} over QUIC (RFC 9000)
+\cite{rfc9000} -- multi-stream with per-stream loss recovery, eliminating
+TCP-level HoL blocking. Adoption lags in embedded, kernel-bypass,
+broker-to-broker, and trusted-network environments. Post-quantum profiles
+are still being standardized.
+\end{itemize}
+
+ZAP-WS occupies the same design space as HTTP/3 streams but differs in
+three respects: (i) the underlying ZAP handshake is post-quantum by
+default (ML-KEM-768 hybrid with X25519, ML-DSA-65 with Ed25519); (ii) the
+per-stream loss recovery mechanism may use Reed--Solomon FEC rather than
+retransmission, eliminating one round-trip on the recovery path;
+(iii) the API is exposed as a $\texttt{net.Conn}$-shaped object per
+stream, so existing WebSocket, $\texttt{io.Reader}/\texttt{io.Writer}$,
+and SCTP-style code ports mechanically.
+
+\paragraph{Thesis.} ZAP-WS provides per-stream independent flow control,
+eliminating the head-of-line blocking that affects WebSocket and HTTP/2
+streams sharing a TCP connection, while retaining mutual authentication
+and post-quantum confidentiality from the underlying ZAP transport.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item A frame format and stream multiplexing scheme that gives each
+logical stream its own sequence space, window, and (optional) FEC group.
+\item A formal tail-latency independence theorem (Theorem 1) and a
+throughput composition theorem (Theorem 2), proved under a Bernoulli
+packet-loss model.
+\item A practical comparison with WebSocket, HTTP/2, HTTP/3, MPTCP
+\cite{rfc8684}, and SCTP \cite{rfc4960}.
+\item A reference implementation sketch and guidance on when ZAP-WS is
+materially better than HTTP/3.
+\end{enumerate}
+
+\section{Head-of-Line Blocking Analysis}
+\label{sec:hol}
+
+\subsection{TCP byte-stream model}
+
+A TCP connection delivers bytes in order. Internally, TCP buffers
+out-of-order segments at the receiver and waits for missing segments to
+be retransmitted before delivering subsequent in-order data to the
+application. Concretely, if segments
+$S_1, S_2, \ldots, S_n$ are sent and $S_k$ is lost, segments
+$S_{k+1}, \ldots, S_n$ are buffered at the receiver until $S_k$ is
+retransmitted and arrives. The application sees a stall of one
+retransmission timeout (RTO) or fast-retransmit RTT, regardless of
+whether the bytes in $S_{k+1}, \ldots, S_n$ are part of the same logical
+unit of work as $S_k$.
+
+\subsection{HTTP/2 over TCP}
+
+HTTP/2 multiplexes \emph{streams} -- bidirectional sequences of frames --
+over a single TCP connection \cite{rfc9113}. Frames from different
+streams are interleaved on the wire. A lost segment carrying frames of
+stream 7 will, by the TCP semantics above, block delivery of any stream's
+frames sent in subsequent segments. Stream 9's frame may already have
+arrived at the kernel but the application cannot read it.
+
+\subsection{HTTP/3 over QUIC}
+
+QUIC implements stream multiplexing inside the cryptographic transport
+itself \cite{rfc9000}. Each stream has independent flow control and
+independent loss detection. A lost packet only delays the streams whose
+frames it actually contained. HoL blocking at the transport layer is
+eliminated.
+
+\subsection{ZAP-WS}
+
+ZAP-WS adopts the QUIC philosophy -- streams are first-class transport
+objects, not application-layer multiplexes over a byte stream -- but
+implements them on top of ZAP datagrams (which themselves run over UDP
+or other packet substrates). Each ZAP-WS stream has:
+
+\begin{enumerate}
+\item An independent 64-bit sequence space.
+\item An independent receive window and credit-based backpressure
+($\texttt{WINDOW\_UPDATE}$ frames sent per stream, not per connection).
+\item An optional FEC group: a $(k, m)$ Reed--Solomon code applied
+across $k$ data frames producing $m$ parity frames, allowing the
+receiver to reconstruct up to $m$ losses without round-trip
+retransmission.
+\end{enumerate}
+
+\section{ZAP-WS Construction}
+\label{sec:construction}
+
+\subsection{Frame format}
+
+Each ZAP-WS frame on the wire is:
+
+\begin{verbatim}
+  +------+--------+--------+----------+----------+--------+
+  | Type | StrmID | StrmSeq| FECGrp   | FECIndex | Payld  |
+  | 1B   | varint | varint | varint?  | varint?  | bytes  |
+  +------+--------+--------+----------+----------+--------+
+\end{verbatim}
+
+Frame types: \texttt{DATA}, \texttt{WINDOW\_UPDATE},
+\texttt{STREAM\_OPEN}, \texttt{STREAM\_CLOSE}, \texttt{FEC\_PARITY},
+\texttt{PING}, \texttt{GOAWAY}. The \texttt{FECGrp} and
+\texttt{FECIndex} fields are present only when the connection negotiated
+FEC for the stream.
+
+\subsection{Stream lifecycle}
+
+A stream is opened by either peer with \texttt{STREAM\_OPEN}. Streams are
+identified by 62-bit IDs. Bit 0 distinguishes initiator (client/server),
+bit 1 distinguishes reliable/unreliable. After \texttt{STREAM\_CLOSE}
+from both sides, the stream ID is retired but never reused on the same
+connection.
+
+\subsection{Per-stream flow control}
+
+Each receiver advertises an initial window $W_0$ (typically 256~KiB) and
+sends \texttt{WINDOW\_UPDATE} frames as the application drains data. A
+sender that exhausts a stream's window blocks \emph{only that stream};
+other streams are unaffected.
+
+\subsection{Forward error correction}
+
+When FEC is negotiated for a stream with parameters $(k, m)$, the sender
+groups $k$ consecutive \texttt{DATA} frames into a FEC group, computes
+$m$ \texttt{FEC\_PARITY} frames using a systematic Reed--Solomon code
+\cite{reed1960}, and transmits the $k+m$ frames. The receiver can
+reconstruct the original $k$ data frames after receiving any $k$ of the
+$k+m$, tolerating up to $m$ losses without retransmission.
+
+\paragraph{Overhead bound.} The bandwidth overhead of $(k, m)$ FEC is
+exactly $m/k$. This is independent of which frames are lost.
+
+\subsection{Cryptographic envelope}
+
+ZAP-WS frames travel inside ZAP records that are AEAD-encrypted under a
+session key established by the ZAP handshake \cite{zap-handshake}. The
+handshake is hybrid post-quantum: ML-KEM-768 + X25519 for key
+encapsulation and ML-DSA-65 + Ed25519 for authentication. Confidentiality
+and authenticity therefore hold under both classical and quantum
+adversaries (assuming ML-KEM and ML-DSA assumptions). HTTP/3 does not yet
+mandate post-quantum profiles; ZAP-WS does, by construction.
+
+\section{Comparison}
+\label{sec:comparison}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+                       & WebSocket & HTTP/2 & HTTP/3 & ZAP-WS \\
+\midrule
+Multi-stream           & app-layer & native & native  & native \\
+TCP HoL blocking       & yes       & yes    & n/a     & n/a \\
+Per-stream window      & no        & yes    & yes     & yes \\
+Loss recovery          & TCP rtx   & TCP rtx& QUIC rtx& rtx + FEC \\
+Post-quantum mandatory & no        & no     & no      & yes \\
+Embedded-friendly      & yes       & no     & limited & yes \\
+\bottomrule
+\end{tabular}
+\caption{Streaming protocol comparison.}
+\end{table}
+
+\section{Latency Model}
+\label{sec:latency}
+
+Let a connection carry $N$ streams $s_1, \ldots, s_N$. Let
+$L(s_i, f)$ denote the application-observed arrival latency of frame $f$
+of stream $s_i$. Assume an i.i.d.\ Bernoulli packet-loss channel with
+loss probability $p$ and one-way base delay $D$.
+
+\begin{proposition}[WebSocket / HTTP/2 over TCP -- HoL]
+For WebSocket and HTTP/2, the latency of stream $s_i$'s frame $f$
+satisfies
+\[
+L(s_i, f) \ge D + \mathbb{1}[\text{any earlier byte in TCP order was
+lost}] \cdot R,
+\]
+where $R$ is the retransmission delay (bounded below by one RTT, often
+RTO). Hence $L(s_i, f)$ is dependent on traffic of all other streams
+$s_j$, $j \ne i$.
+\end{proposition}
+
+\begin{proposition}[ZAP-WS / HTTP/3 -- no HoL]
+For ZAP-WS, the latency of stream $s_i$'s frame $f$ satisfies
+\[
+L(s_i, f) \ge D + \mathbb{1}[\text{a packet carrying part of $f$ in
+$s_i$ was lost}] \cdot R',
+\]
+where $R'$ is the per-stream recovery delay -- either an RTT for
+retransmission, or $0$ if FEC parity within the stream's FEC group is
+sufficient to reconstruct $f$. The indicator depends only on losses
+affecting $s_i$.
+\end{proposition}
+
+These propositions are formalized and proved in
+$\texttt{proofs/streaming-tail-latency/proof.tex}$ as Theorem 1.
+
+\section{Use Cases}
+
+\subsection{Market data fanout}
+
+A market-data publisher serves $N$ symbols to many subscribers. With
+WebSocket, a single packet drop in the symbol-A stream stalls symbol-B
+quotes. With ZAP-WS, each symbol can be its own stream with its own FEC
+group, sized to the symbol's update cadence and tolerable staleness.
+Tail-latency p99.9 on symbol B is independent of symbol-A loss events.
+
+\subsection{Agent-to-agent task streams}
+
+In multi-agent systems, an orchestrator drives many agents in parallel.
+Each agent's task plan, tool calls, and partial results are a logical
+stream. Per-stream independence means a slow agent (long tool execution,
+local disk wait) cannot block fast agents' frames.
+
+\subsection{Telemetry / log shipping}
+
+Distinct services shipping logs over a single ZAP connection get
+independent backpressure. A burst of error-log volume from service X does
+not delay metric frames from service Y.
+
+\subsection{Real-time notifications}
+
+Notification services often multiplex many subscriptions per user. With
+ZAP-WS, a stalled subscription does not delay the rest of the user's
+subscriptions.
+
+\section{Implementation}
+
+The reference ZAP-WS implementation exposes the following Go API
+(adapted from the existing $\texttt{net.Conn}$ interface):
+
+\begin{lstlisting}[language=Go, basicstyle=\small\ttfamily]
+type Conn interface {
+    OpenStream(opts StreamOpts) (Stream, error)
+    AcceptStream() (Stream, error)
+    Close() error
+}
+
+type Stream interface {
+    net.Conn   // Read, Write, Close, deadlines
+    StreamID() uint64
+    SetFEC(k, m int) error
+}
+\end{lstlisting}
+
+This signature is intentionally compatible with $\texttt{golang.org/x/net/quic.Stream}$
+shape; existing code that writes to a QUIC stream ports without
+substantive change. Bindings exist for C, Rust, Python, Java, JS,
+OCaml, and the other targets in the $\texttt{zap-proto.io}$ family.
+
+\section{When NOT to use ZAP-WS}
+
+ZAP-WS is targeted at \emph{many concurrent logical streams}. For pure
+bulk file transfer where the natural shape is a single ordered byte
+stream, the ZAP record interface (no per-stream framing overhead) is
+preferable. For scenarios where a single very large message is sent
+periodically with no concurrent traffic, WebSocket or HTTP/2 are
+adequate; the FEC and per-stream overhead of ZAP-WS would add bytes
+without latency benefit.
+
+\section{When ZAP-WS is materially better than HTTP/3}
+
+\begin{enumerate}
+\item \textbf{Post-quantum mandates.} HTTP/3 standardization is still
+phasing in PQ key exchange. ZAP-WS is PQ-by-default today.
+\item \textbf{FEC-driven tail control.} HTTP/3 recovers lost packets via
+retransmission, costing at least one RTT. ZAP-WS optionally uses
+Reed--Solomon FEC, recovering losses with zero added round trips at the
+cost of $m/k$ bandwidth. For p99.9 latency in lossy networks
+(satellite, mobile, congested datacenter east-west), this matters.
+\item \textbf{Embedded / kernel-bypass.} QUIC implementations are large
+and userspace-coupled; ZAP-WS has small implementations suitable for
+microcontrollers and DPDK fast paths.
+\item \textbf{Trusted-network broker meshes.} ZAP-WS provides
+mutual-auth-by-default with PQ identities, which simplifies broker
+mesh deployments compared to bolting mTLS onto HTTP/3.
+\end{enumerate}
+
+\section{Related Work}
+
+WebSocket \cite{rfc6455}, HTTP/2 \cite{rfc9113}, HTTP/3 \cite{rfc9114},
+QUIC \cite{rfc9000}, Reed--Solomon coding \cite{reed1960}, MPTCP
+\cite{rfc8684}, SCTP \cite{rfc4960}, Google QUIC measurements
+\cite{langley2017quic}. Head-of-line blocking has been measured
+empirically by Wang et al.\ \cite{wang2014http2hol} and others.
+
+\section{Conclusion}
+
+ZAP-WS gives applications independent logical streams over a single
+authenticated, post-quantum-encrypted connection. The independence is
+formal: tail latency on one stream is statistically independent of
+traffic on other streams (Theorem 1, proof in companion document).
+Aggregate throughput composes additively up to link capacity (Theorem 2).
+The construction is simple, ports existing WebSocket-style code without
+API friction, and removes the head-of-line blocking that has been the
+single biggest practical objection to multiplexing many real-time
+streams over one connection.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}

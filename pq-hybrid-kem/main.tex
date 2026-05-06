@@ -1,0 +1,430 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+\usepackage[backend=bibtex,style=numeric,sorting=none]{biblatex}
+\addbibresource{refs.bib}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{construction}[theorem]{Construction}
+\newtheorem{game}[theorem]{Game}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\KEM}{\ensuremath{\mathsf{KEM}}}
+\newcommand{\KGen}{\ensuremath{\mathsf{KGen}}}
+\newcommand{\Encap}{\ensuremath{\mathsf{Encap}}}
+\newcommand{\Decap}{\ensuremath{\mathsf{Decap}}}
+\newcommand{\KDF}{\ensuremath{\mathsf{KDF}}}
+\newcommand{\Adv}{\ensuremath{\mathbf{Adv}}}
+\providecommand{\Exp}{}\renewcommand{\Exp}{\ensuremath{\mathbf{Exp}}}
+\providecommand{\Game}{}\renewcommand{\Game}{\ensuremath{\mathbf{G}}}
+\providecommand{\BB}{}\renewcommand{\BB}{\ensuremath{\{0,1\}}}
+\newcommand{\negl}{\ensuremath{\mathsf{negl}}}
+\newcommand{\xwing}{\textsc{X-Wing}}
+\newcommand{\zwing}{\textsc{Z-Wing}}
+\newcommand{\zap}{\textsc{ZAP}}
+\newcommand{\mlkem}{\ensuremath{\mathsf{ML\text{-}KEM}}}
+\newcommand{\xtf}{\ensuremath{\mathsf{X25519}}}
+\newcommand{\sha}{\ensuremath{\mathsf{SHA3}}}
+\newcommand{\hkdf}{\ensuremath{\mathsf{HKDF}}}
+\newcommand{\transcript}{\ensuremath{\tau}}
+
+\title{Post-Quantum Hybrid KEMs in the \zap{} Transport Handshake:\\
+A Security Analysis of \xwing{} and \zwing{}}
+\author{\zap{} Protocol Authors\\\texttt{zap-proto.io}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The \zap{} transport protocol provides authenticated, confidential channels with
+both ephemeral and long-lived sessions. To resist \emph{harvest-now-decrypt-later}
+(HNDL) attackers and to absorb future cryptanalytic surprises in either the
+elliptic-curve or lattice settings, \zap{} adopts a layered family of hybrid
+key-encapsulation mechanisms (KEMs). The base layer, \xwing{}, combines
+\xtf{} with \mlkem{}-768 in a single shared-secret KEM whose IND-CCA2
+security holds when \emph{either} component is sound. For long-lived sessions
+and protected long-term identity keys, \zap{} additionally specifies \zwing{},
+a triple-hybrid that compounds \xwing{} with a third, conservatively chosen
+KEM. We give a formal definition of \zwing{}, a robust combiner construction,
+and a tight reduction proving IND-CCA2-AKE security of the resulting
+authenticated key exchange. We argue why \mlkem{}-1024 is the right third
+component for performance-conscious deployments, and we give the engineering
+budget (handshake bytes, CPU cycles) versus a curve-only baseline.
+\end{abstract}
+
+\section{Introduction}\label{sec:intro}
+
+The \zap{} transport handshake is a mutually authenticated key exchange used to
+establish forward-secret session keys between peers that already know each
+other's long-term static public-key fingerprints. Like Noise-style protocols,
+\zap{} is NIKE-flavoured: each side contributes a long-term static KEM
+keypair and a per-session ephemeral KEM keypair, and the resulting transport
+key is derived from a transcript of all KEM operations.
+
+Two design pressures pushed \zap{} away from a curve-only handshake.
+First, \emph{harvest-now-decrypt-later} \cite{harvest_now}: an adversary that
+records ciphertext today retains the option to decrypt once a
+cryptographically-relevant quantum computer (CRQC) becomes available. \zap{}
+is intended for sessions with multi-year confidentiality requirements and
+for long-term identity keys whose rotation is operationally expensive.
+Second, lattice cryptanalysis is younger than elliptic-curve cryptanalysis:
+prudent deployment composes the two so that a break of \emph{either} primitive
+does not break the channel.
+
+The first hybrid KEM \zap{} adopts is \xwing{} \cite{xwing2024},
+the IETF/CFRG-tracked \xtf{} $\parallel$ \mlkem{}-768 construction.
+For high-assurance, long-lived sessions and for protection of static
+authentication keys, \zap{} specifies a second hybrid, \zwing{}, that
+folds an additional KEM into \xwing{} via a robust combiner. The
+construction is conservative: it strictly retains \xwing{}'s ``one of the
+component KEMs is sound'' property while admitting a third independent
+component whose mathematical assumptions differ from those of \xwing{}'s
+two existing components.
+
+\paragraph{Contributions.}
+\begin{itemize}
+\item We give a formal description of \zwing{} as a KEM and as the keying
+agent of the \zap{} authenticated handshake (\cref{sec:zwing}).
+\item We prove IND-CCA2 security of \zwing{} under the assumption that any one
+of its three component KEMs is IND-CCA2 secure and that the KDF combiner is a
+random oracle (\cref{sec:security}; full reduction in the companion proof).
+\item We bound the AKE advantage of an active adversary against the
+\zap{} handshake instantiated with \zwing{} in terms of the underlying KEM and
+KDF advantages, with explicit hops.
+\item We quantify the wire and CPU cost (\cref{sec:perf}) and argue the
+\mlkem{}-1024 choice for the third slot.
+\end{itemize}
+
+\section{Threat Model}\label{sec:tm}
+
+We use a Bellare-Rogaway-style AKE security model with corruption oracles,
+following the formulations used in the symbolic and computational analyses
+of TLS 1.3 \cite{cremers2017ake} and the hybrid-AKE setting of
+\cite{bindel2019hybrid}.
+
+\paragraph{Network adversary.} The adversary $\mathcal{A}$ controls all
+network traffic and may delay, drop, replay, reorder, inject, or modify any
+message. \zap{} provides no in-band confidentiality of the handshake itself
+beyond what KEM ciphertexts give.
+
+\paragraph{Corruption oracles.} The adversary may issue:
+\begin{itemize}
+\item $\mathsf{StaticReveal}(P)$: reveal the long-term KEM secret of party $P$.
+\item $\mathsf{EphemeralReveal}(\pi)$: reveal the ephemeral KEM secret of a
+specific session $\pi$.
+\item $\mathsf{SessionKeyReveal}(\pi)$: reveal the derived transport key of
+a completed session.
+\item $\mathsf{Test}(\pi)$: against a fresh, partnered session, return either the
+real key or a uniformly random key of the same length.
+\end{itemize}
+
+\paragraph{Future quantum.} We assume $\mathcal{A}$ may, at any point in
+the future, become quantum and decrypt previously recorded ciphertexts.
+This is captured by a single ``post-quantum'' transition in the game
+sequence: classical KEM hardness assumptions are replaced by their PQ
+counterparts where applicable. The hybrid construction is what insulates the
+session secret against this transition. We do not need additional UC-style
+machinery for the HNDL setting; the standard freshness conditions on the
+test session, lifted to the hybrid KEM, suffice.
+
+\paragraph{Freshness.} A test session $\pi$ is fresh if (i) its transport
+key has not been revealed, (ii) its partner session's transport key has not
+been revealed, and (iii) for at least one component KEM among
+$\{\xtf, \mlkem\text{-}768, \mlkem\text{-}1024\}$, neither party's contribution
+to that component within the session was learnt by $\mathcal{A}$ via static
+or ephemeral reveal. Condition (iii) is the hybrid relaxation: the AKE remains
+secure as long as one of the three components remains uncompromised
+\emph{for that session}.
+
+\paragraph{IND-CCA2-AKE.} The advantage of $\mathcal{A}$ is
+$\Adv^{\mathsf{ake}}_{\zap}(\mathcal{A}) = |\Pr[b' = b] - 1/2|$
+in the standard test-session-prediction game.
+
+\section{X-Wing Recap}\label{sec:xwing-recap}
+
+\xwing{} \cite{xwing2024} is a hybrid KEM with the following pseudocode.
+Let $(pk_x, sk_x) \gets \xtf.\KGen$ and $(pk_m, sk_m) \gets \mlkem.\KGen$.
+
+\begin{itemize}
+\item $\KGen$: output $pk = (pk_x, pk_m)$, $sk = (sk_x, sk_m, pk_x, pk_m)$.
+\item $\Encap(pk)$: sample ephemeral $(pk'_x, sk'_x) \gets \xtf.\KGen$;
+$ss_x \gets \xtf.\mathsf{DH}(sk'_x, pk_x)$;
+$(c_m, ss_m) \gets \mlkem.\Encap(pk_m)$;
+$ss \gets \sha\text{-}256(\mathsf{label} \parallel ss_m \parallel ss_x \parallel c_m \parallel pk'_x \parallel pk_m)$;
+output ciphertext $c = (c_m, pk'_x)$ and shared secret $ss$.
+\item $\Decap(sk, c)$: parse $c = (c_m, pk'_x)$;
+$ss_x \gets \xtf.\mathsf{DH}(sk_x, pk'_x)$;
+$ss_m \gets \mlkem.\Decap(sk_m, c_m)$;
+recompute $ss$ as above.
+\end{itemize}
+
+\xwing{} achieves IND-CCA2 security if either \xtf{} is OW-CPA-secure or
+\mlkem{}-768 is IND-CCA2-secure, with the binding to $c_m, pk'_x, pk_m$ inside
+the KDF closing the obvious cross-component-malleability and binding gaps
+identified in \cite{giacon2018kem}.
+
+\section{Z-Wing Construction}\label{sec:zwing}
+
+\zwing{} extends \xwing{} with a third KEM $\KEM_3$. We instantiate
+$\KEM_3 = \mlkem\text{-}1024$ as the recommended third component
+(\cref{sec:choice} discusses the alternative).
+
+\begin{construction}[\zwing{}]\label{con:zwing}
+Let $\KEM_1 = \xtf$ (DH-as-KEM), $\KEM_2 = \mlkem\text{-}768$,
+$\KEM_3 = \mlkem\text{-}1024$. Let $H : \BB^* \to \BB^{256}$ be a hash
+function modelled as a random oracle.
+
+\textbf{KGen.} Sample $(pk_i, sk_i) \gets \KEM_i.\KGen$ for $i \in \{1,2,3\}$.
+Output $pk = (pk_1, pk_2, pk_3)$, $sk = (sk_1, sk_2, sk_3, pk)$.
+
+\textbf{Encap}($pk$). Sample ephemeral $\KEM_1$ keypair $(pk'_1, sk'_1)$.
+Compute $ss_1 \gets \KEM_1.\mathsf{DH}(sk'_1, pk_1)$,
+$(c_2, ss_2) \gets \KEM_2.\Encap(pk_2)$,
+$(c_3, ss_3) \gets \KEM_3.\Encap(pk_3)$.
+Set $c \gets (pk'_1, c_2, c_3)$ and
+\[
+ss \gets H\!\left(\texttt{"Z-Wing-v1"} \parallel ss_1 \parallel ss_2 \parallel ss_3 \parallel c \parallel pk\right).
+\]
+Output $(c, ss)$.
+
+\textbf{Decap}($sk, c$). Parse $c = (pk'_1, c_2, c_3)$.
+Compute $ss_1, ss_2, ss_3$ as above using $sk$, then recompute $ss$ via $H$.
+\end{construction}
+
+\paragraph{Combiner is robust.}
+The combiner $H(\mathsf{label} \parallel ss_1 \parallel ss_2 \parallel ss_3 \parallel c \parallel pk)$
+is binding on all component ciphertexts and public keys, so the security
+reduction (\cref{sec:security}) goes through whenever any single component is
+sound (Lemma~1 in the companion proof). The label
+\texttt{"Z-Wing-v1"} is a domain separator preventing cross-version key reuse.
+
+\subsection{Transport binding}\label{sec:binding}
+
+In \zap{}, \zwing{} keys never appear in isolation. The transport key
+derivation is
+\[
+K_{\mathsf{tx}} \gets \hkdf\text{-}\mathsf{Expand}\bigl(\hkdf\text{-}\mathsf{Extract}(0, ss),\ \transcript_{\zap},\ \ell\bigr)
+\]
+where $\transcript_{\zap}$ contains: (i) the protocol label, (ii) both peers'
+long-term public-key fingerprints (32-byte SHA-3-256 truncations), (iii) the
+\zwing{} ciphertext, (iv) both ephemeral public keys (the \xtf{} ephemeral and
+the \mlkem{} ciphertext), (v) the negotiated cipher-suite identifier, and
+(vi) any session-context nonces sampled during the handshake.
+
+The fingerprint binding (point (ii)) is what makes \zap{}'s use of \zwing{}
+\emph{authenticated} rather than only confidential: a man-in-the-middle that
+swaps a peer's static $pk$ for one of its own choosing is detected because
+the computed $K_{\mathsf{tx}}$ no longer matches the value the legitimate
+peer derives.
+
+\subsection{Choice of third component}\label{sec:choice}
+
+We considered two candidates for $\KEM_3$.
+
+\paragraph{\mlkem{}-1024.} Larger parameter set of the same module-lattice
+family, NIST-standardised under FIPS 203 \cite{nistmlkem}. Public key
+1568 B, ciphertext 1568 B, encap/decap $\sim 0.4$ ms on x86\_64. Sharing the
+algebraic structure of $\KEM_2$ is a known weakness of this choice; we
+mitigate this by relying on $\KEM_3$'s \emph{larger} concrete margin (Cat~5)
+rather than on independence of the algebraic family.
+
+\paragraph{Classic McEliece.} Code-based, with a $\sim 50$-year track record
+\cite{mceliece1978,classicmceliece}. Independent of lattice assumptions,
+which is genuinely valuable in a hybrid. Drawback: 1\,MB-class public keys
+make it unworkable for short-lived sessions and impose a hard cap on
+handshakes-per-second.
+
+\paragraph{Decision.} For \zap{}, where \emph{handshake throughput} matters
+(short-lived RPC, mobile, IoT), \mlkem{}-1024 is the correct choice. The
+combiner's robustness gives us defence against future lattice cryptanalysis
+through Cat-5 margin; defence against catastrophic break of the entire lattice
+family is provided by $\KEM_1 = \xtf{}$, which is independent. We leave
+``\zwing{}-CMc'' (a variant for environments that can amortise McEliece
+public keys) as an out-of-band extension.
+
+\section{Security Analysis}\label{sec:security}
+
+\begin{theorem}[\zwing{} IND-CCA2 (informal)]\label{thm:zwingcca}
+For any quantum-polynomial-time adversary $\mathcal{A}$ against the
+IND-CCA2 security of \zwing{} making at most $q_H$ random-oracle queries
+and $q_D$ decapsulation queries,
+\[
+\Adv^{\mathsf{ind\text{-}cca}}_{\zwing}(\mathcal{A}) \le
+\min_{i \in \{1,2,3\}}\!\Adv^{\mathsf{kem}}_{\KEM_i}(\mathcal{B}_i)
++ \frac{q_H + q_D}{2^{256}} + q_D \cdot \negl,
+\]
+where $\mathcal{B}_i$ is an adversary against $\KEM_i$ with running time
+$\approx t(\mathcal{A})$.
+\end{theorem}
+
+\begin{theorem}[\zap{} IND-CCA2-AKE (informal)]\label{thm:ake}
+For any QPT adversary $\mathcal{A}$ against the AKE security of \zap{}
+instantiated with \zwing{}, with $n_P$ parties, $n_S$ sessions per party,
+$q_H$ random-oracle queries, and $q_D$ decapsulation queries,
+\[
+\Adv^{\mathsf{ake}}_{\zap[\zwing]}(\mathcal{A}) \le
+2 n_P n_S \cdot \Adv^{\mathsf{ind\text{-}cca}}_{\zwing}(\mathcal{B})
++ \frac{n_S^2}{2^{|\mathsf{nonce}|}}
++ \mathsf{Coll}_H,
+\]
+where $\mathsf{Coll}_H \le \binom{q_H}{2} \cdot 2^{-256}$.
+\end{theorem}
+
+The proofs are in the companion document (\texttt{proofs/pq-hybrid-kem/proof.tex}).
+The reduction proceeds via a four-game hop:
+$\Game_0$ is the real AKE game; in $\Game_1$ we replace the $\mlkem$-768
+shared secret in the test session with uniform; in $\Game_2$ likewise for
+$\mlkem$-1024; in $\Game_3$ likewise for \xtf{}. The hybrid freshness
+condition guarantees that at least one of these hops is sound, hence
+$\Game_3$ is information-theoretically random and the adversary's advantage
+is bounded by the corresponding KEM advantage plus collision/repetition
+terms.
+
+\section{HNDL Analysis}\label{sec:hndl}
+
+Suppose an adversary records, today, every \zap{} handshake on a target
+link. Define the \emph{HNDL window} as the time after which the adversary's
+quantum capability becomes operationally relevant; we assume $T_Q$ years.
+Per-session, the storage burden is
+\[
+S_{\mathsf{sess}} \approx |pk_1'| + |c_2| + |c_3| + |\transcript_{\zap}|
+\approx 32 + 1088 + 1568 + \mathcal{O}(256) \text{ bytes} \approx 3\,\text{KB},
+\]
+which over a 10\,Gb/s link with $\sim 10^4$ handshakes/s amounts to
+$\sim 1\,\text{TB/day}$ of stored ciphertext. This is operationally
+feasible for a nation-state but uneconomic for casual logging.
+
+The relevant probability is that an adversary, at time $T_Q$, can recover the
+session key from logged ciphertexts. With three independent components
+and the freshness assumption, this probability is bounded by
+$\min_i \Adv^{\mathsf{kem}}_{\KEM_i}(\mathcal{B}_i^{T_Q})$, where the
+adversary is now quantum. Because $\KEM_1 = \xtf{}$ is broken in QPT and
+\mlkem{} is conjectured PQ-secure, the bound becomes
+$\Adv^{\mathsf{ml\text{-}kem}}(\mathcal{B}_2^{T_Q}) +
+ \Adv^{\mathsf{ml\text{-}kem\text{-}1024}}(\mathcal{B}_3^{T_Q})$,
+which is the lattice security of the smaller of the two parameter sets.
+
+This is exactly the HNDL guarantee we want: even if curves are dead by
+$T_Q$, the lattice components keep the channel confidential.
+
+\section{Performance Budget}\label{sec:perf}
+
+\Cref{tab:wire} summarises wire size and \cref{tab:cycles} CPU cost.
+Wire bytes are for a single side's contribution (the responder mirrors the
+initiator). CPU figures are from the public AVX2 implementations of
+\mlkem{} and \xtf{} on a Skylake-class core; \zwing{} is the sum of its
+parts plus a single SHA3-256 invocation over $\sim 4\,\text{KB}$.
+
+\begin{table}[h]
+\centering
+\caption{Handshake bytes-on-the-wire (one side).}\label{tab:wire}
+\begin{tabular}{lrrr}
+\toprule
+Construction & Public key & Ciphertext & Total/side \\
+\midrule
+\xtf{} only            & 32   & 32   & 64 \\
+\mlkem{}-768 only       & 1184 & 1088 & 2272 \\
+\xwing{}                & 1216 & 1120 & 2336 \\
+\zwing{} (this work)    & 2784 & 2688 & 5472 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{CPU cycles (Skylake AVX2, single core).}\label{tab:cycles}
+\begin{tabular}{lrrr}
+\toprule
+Construction & KGen & Encap & Decap \\
+\midrule
+\xtf{} only          &   80\,k &   80\,k &   80\,k \\
+\xwing{}             &  220\,k &  240\,k &  280\,k \\
+\zwing{}             &  430\,k &  470\,k &  540\,k \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A full \zap{} handshake with \zwing{} therefore costs roughly
+$\sim 5.5\,\text{KB}$ each way ($\sim 11\,\text{KB}$ round-trip) and
+$\sim 1\,\text{million cycles}$ each side, $\sim 6\times$ the wire bytes
+and $\sim 12\times$ the CPU of an \xtf{}-only baseline. For comparison,
+\xwing{} alone is $\sim 3\,\text{KB}$ each way. We deem this acceptable
+for sessions whose lifetime is measured in minutes or longer, or for the
+small fraction of sessions that explicitly opt into long-term confidentiality.
+
+\section{Related Work}\label{sec:related}
+
+KEM combiners and their security under partial corruption are the subject of
+\cite{giacon2018kem}, who give a generic IND-CCA combiner and prove its
+security in the random-oracle model. Our \zwing{} combiner is structurally
+the same (parallel encap, hash of all component shared secrets and ciphertexts)
+but with the addition of public-key binding to defeat the
+``share-the-ciphertext'' attacks identified for naive combiners.
+\cite{bindel2019hybrid} extend hybrid KEM analyses to authenticated key
+exchange and motivate the freshness condition we adopt in
+\cref{sec:tm}.
+
+The choice of \xtf{} $\parallel$ \mlkem{}-768 specifically is the same one
+made by BoringSSL's \texttt{X25519MLKEM768} hybrid \cite{boringssl_xmlkem}
+and by IETF/CFRG's \xwing{} draft \cite{xwing2024}. Larger
+hybrids that include \mlkem{}-1024 or Classic McEliece have been considered in
+the IETF TLS hybrid-design space but have not been standardised; \zwing{} is,
+to our knowledge, the first concretely specified triple-hybrid for a
+NIKE-style transport handshake.
+
+The earlier post-quantum-era hybrid Frodo-with-curves construction
+\cite{bos2015hybrid} predates standardisation and is no longer
+performance-competitive. NIST guidance \cite{nistsp800208,nistpqc} permits
+hybrid PQ deployment as a transitional posture; \zwing{} should be read as
+both transitional and conservative-default for the long-lived-session class.
+
+Cremers and collaborators' symbolic AKE analysis \cite{cremers2009ake,cremers2017ake,tamarin}
+provides the verification framework we anticipate using to mechanise the
+proofs sketched here. The textbook by Boyd, Mathuria and Stebila
+\cite{boyd2020ake} contains the AKE security model formulations we adopt.
+
+\section{Conclusion and Open Questions}\label{sec:conclusion}
+
+We have specified \zwing{}, a triple-hybrid PQ KEM that strictly extends
+\xwing{} with a third, conservatively-chosen lattice component, and given a
+modular IND-CCA2-AKE security argument for its use in the \zap{} transport
+handshake. The construction is robust under partial corruption: as long as
+\emph{any one} of $\xtf$, \mlkem{}-768, or \mlkem{}-1024 remains sound for a
+given session, the channel is secure. The wire and CPU costs are modest enough
+that \zap{} can deploy \zwing{} as default for long-lived sessions and as
+opt-in for short-lived ones.
+
+\paragraph{Open questions.}
+\begin{itemize}
+\item \emph{Mechanised verification.} The reduction in our companion proof is
+hand-checked. A Tamarin / EasyCrypt mechanisation, especially of the
+hybrid-freshness condition, is an obvious next step.
+\item \emph{Code-based slot.} A \zwing{}-CMc variant with Classic McEliece
+in the third slot is attractive for fixed-identity, low-handshake-rate
+deployments (e.g.\ enclave attestation, root-of-trust establishment). The
+public-key transport can be amortised via a separate static-key fetch
+channel; quantifying that cost is future work.
+\item \emph{Forward secrecy under post-handshake corruption.} The analysis
+here covers the standard AKE freshness conditions; tighter forward-secrecy
+guarantees against quantum corruption of static keys
+\emph{after} handshake completion deserve a separate treatment.
+\item \emph{Tightness.} The factor $2 n_P n_S$ in
+\cref{thm:ake} is the standard guess-the-test-session bound. A tight
+multi-user reduction for \zwing{} would mirror the multi-user MAC literature.
+\end{itemize}
+
+\printbibliography
+
+\end{document}

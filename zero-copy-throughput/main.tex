@@ -1,0 +1,334 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amsthm,amssymb}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage[capitalize,noabbrev]{cleveref}
+\usepackage[
+  backend=biber,
+  style=numeric-comp,
+  sorting=none
+]{biblatex}
+\addbibresource{refs.bib}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\theoremstyle{remark}
+\newtheorem*{remark}{Remark}
+
+\title{Zero-Copy Wire Formats and the End of the Serialization Tax:\\
+A Latency Model and Benchmark Methodology for the ZAP Protocol}
+\author{ZAP Protocol Authors\\\texttt{zap-proto.io}}
+\date{2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Modern microservice deployments spend a measurable fraction of CPU
+on encoding and decoding RPC payloads. Profiling of warehouse-scale
+workloads attributes 4--7\% of cycles to protocol-buffer-style
+serialization in hot paths~\cite{kanev2015profiling}.
+We present a formal latency model and a benchmark methodology for the
+ZAP wire format, a Cap'n~Proto--derived encoding that places no
+parsing step between received bytes and program-visible objects.
+We decompose RPC latency into serialization, transit, deserialization,
+and handler components, and show that for ZAP the serialization and
+deserialization terms collapse to constant time in field count, leaving
+only payload-byte cost. We give a throughput-bound theorem proving that
+ZAP's effective bandwidth approaches link rate under bounded payload
+size, while protobuf-over-HTTP/2 plateaus at roughly 60--70\%\ due to
+HPACK and tag-length-value overhead. We describe a reproducible
+single-machine and 10\,GbE benchmark methodology that reports
+$p50/p95/p99/p999$ tails under both quiescent and congested regimes.
+We discuss honestly when ZAP does \emph{not} win, including
+single-field tiny messages and embedded environments without
+zero-copy mmap.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The serialization tax is the cost a service pays, measured in CPU
+cycles and tail latency, to translate an in-memory object graph into a
+sequence of bytes for transit and back. Profiling of large fleets shows
+this is not a rounding error: in a warehouse-scale measurement,
+serialization libraries together account for 4--7\%\ of all
+cycles~\cite{kanev2015profiling}. At the 99.9th percentile, where users
+notice, the cost is more pronounced because allocator pressure,
+copy-induced cache misses, and HPACK dynamic-table churn each
+contribute their own tail.
+
+We argue, and prove, that this tax is not fundamental. It is an
+artifact of designing wire formats around streaming parsers when the
+deployment reality is mmap'd memory, persistent connections, and
+schemas known at compile time. The ZAP wire format is derived from
+Cap'n Proto~\cite{capnproto,capnproto-encoding}: messages are arenas
+of fixed-layout structs connected by relative pointers, and parsing
+collapses to the identity function on the byte buffer.
+
+This paper makes three contributions:
+\begin{enumerate}
+  \item A formal RAM-model latency decomposition that separates
+        per-field cost from per-byte cost.
+  \item A throughput bound (\Cref{thm:throughput}) and a tail-latency
+        independence result (\Cref{thm:tail}) for the ZAP wire format.
+  \item A benchmark methodology covering small/medium/large RPC sizes,
+        loopback and 10\,GbE, post-quantum handshake amortization, and
+        honest discussion of regimes where ZAP loses.
+\end{enumerate}
+
+\section{Wire Format Recap}
+\label{sec:wire}
+
+\subsection{Arenas and segments}
+A ZAP message is a sequence of \emph{segments}, each a contiguous byte
+range obtained from an arena allocator. Segments are 8-byte aligned.
+Multiple segments form a single logical message and may be transmitted
+back-to-back, mmap'd from a file, or constructed in shared memory.
+
+\subsection{Far-pointer model}
+Pointers are 64-bit relative offsets, not virtual addresses. A pointer
+encodes target segment id and word offset within the segment, plus a
+small tag distinguishing struct, list, far, and capability pointers.
+Because offsets are relative, no fixup is required when the message is
+copied, mmap'd at a different address, or cast directly out of a
+network buffer.
+
+\subsection{Capability tables vs schema-on-the-wire}
+Unlike formats that embed field tags in every record (Protocol
+Buffers~\cite{protobuf}, MessagePack~\cite{msgpack}), ZAP places
+schema information in compile-time-generated accessors. The on-wire
+record is purely positional: byte $k$ of a struct of type $T$ is
+field $T.f_k$ by construction. This is the same trade-off as
+FlatBuffers~\cite{flatbuffers} but with the addition of mutable
+arenas and capability references.
+
+\section{Formal Latency Model}
+\label{sec:model}
+
+\begin{definition}[RPC latency decomposition]
+Let an RPC have request size $n$ bytes spanning $f$ logical fields,
+and let the network round-trip time be $\rho$ and the link bandwidth
+$B$. We decompose end-to-end latency as
+\[
+  L \;=\; L_{\textit{ser}} \;+\; L_{\textit{net}} \;+\; L_{\textit{de}} \;+\; L_{\textit{hdl}},
+\]
+with transit cost $L_{\textit{net}} \;\geq\; \rho + n/B$.
+\end{definition}
+
+\subsection{Per-format costs}
+Under the unit-cost RAM model with constant cache latency $c$, we have
+the following bounds (justified in detail in the companion proof
+document):
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Format & $L_{\textit{ser}}$ & $L_{\textit{de}}$ \\
+\midrule
+JSON over HTTP/2          & $\Theta(n + f \log f)$ & $\Theta(n)$ \\
+Protobuf over HTTP/2      & $\Theta(f + n)$         & $\Theta(f + n)$ \\
+Protobuf over QUIC        & $\Theta(f + n)$         & $\Theta(f + n)$ \\
+ZAP (zero-copy)           & $\Theta(1) + \Theta(p)$ & $\Theta(1)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+where $p$ is the number of variable-length payload bytes that must be
+\emph{copied into} the arena. For fixed-layout structs $p=0$ and
+$L_{\textit{ser}}=O(1)$.
+
+\begin{remark}
+The JSON $f \log f$ term arises from key sorting in canonical
+JSON. The Protobuf $f$ term is varint tag decoding plus
+length-prefixed dispatch. ZAP has neither because field positions are
+determined at compile time.
+\end{remark}
+
+\section{Throughput and Tail-Latency Theorems}
+\label{sec:theorems}
+
+We state results here; full proofs appear in the companion proof
+document at \texttt{proofs/zero-copy-throughput/proof.tex}.
+
+\begin{theorem}[Throughput bound for zero-copy wire]
+\label{thm:throughput}
+Let a workload offer requests of size $n$ bytes at offered load
+$\lambda$, with link bandwidth $B$ and per-request fixed CPU cost
+$\sigma$ (parsing, framing, dispatch). Then the achievable throughput
+$T$ for a wire format with serialization cost $L_{\textit{ser}}(n,f)$ and
+deserialization cost $L_{\textit{de}}(n,f)$ satisfies
+\[
+  T \;\leq\;
+  \min\!\Big(
+    \tfrac{B}{n+h},\;
+    \tfrac{1}{\sigma + L_{\textit{ser}}(n,f) + L_{\textit{de}}(n,f)}
+  \Big),
+\]
+where $h$ is the per-message header overhead. For ZAP under fixed
+layout, $L_{\textit{ser}}=L_{\textit{de}}=O(1)$ and $h$ is $O(1)$ words, so
+$T \to B/n$ as $n \to \infty$. For Protobuf-over-HTTP/2,
+$h \geq h_{\text{HPACK}} + h_{\text{frame}}$ and the CPU bound binds first
+at small $n$, capping $T$ at $0.6$--$0.7\,B/n$.
+\end{theorem}
+
+\begin{theorem}[Tail-latency independence from field count]
+\label{thm:tail}
+Let $L^{(q)}$ denote the $q$-th quantile of single-RPC latency under
+i.i.d.\ payloads with $f$ fields and bounded payload bytes $p$. For ZAP,
+$L^{(q)}(f,p) = L^{(q)}(p) + O(1)$, i.e.\ tail latency is asymptotically
+independent of field count. For Protobuf and JSON, $L^{(q)}$ grows
+linearly in $f$, with the slope at the 99.9th percentile up to
+$5\times$ the median slope due to allocator and HPACK
+dynamic-table tail behavior~\cite{dean2013tail,xu2024microsecond}.
+\end{theorem}
+
+\section{Benchmark Methodology}
+\label{sec:method}
+
+\subsection{Hardware and software baseline}
+\begin{itemize}
+  \item CPU: commodity 8-core x86\_64 at 3.6\,GHz, AVX2, SMT off.
+  \item Memory: 64\,GiB DDR4-3200, 2 channels, NUMA pinned.
+  \item NIC: 10\,GbE, MTU 9000, RX/TX coalescing tuned for tail.
+  \item OS: Linux 6.x with \texttt{tickless} and \texttt{nohz\_full}
+        on benchmark cores; turbo and C-states disabled.
+  \item TLS / KEM: X25519 plus a post-quantum KEM, handshake
+        amortized over $10^5$ RPCs per connection.
+\end{itemize}
+
+\subsection{Workloads}
+\begin{description}
+  \item[Small] 16--128 byte payloads, 4--16 fields. Models cache lookups
+    and feature-flag fetches.
+  \item[Medium] 1--16\,KiB, 32--256 fields. Models row reads and
+    structured event records.
+  \item[Large] 64\,KiB--1\,MiB, lists of structs. Models bulk fetches.
+  \item[Streaming] continuous server-push at 100\,k msg/s sustained for
+    5 minutes; measures GC and allocator pressure.
+\end{description}
+
+\subsection{Measurement protocol}
+\begin{enumerate}
+  \item Warm-up: 30 seconds at target load, results discarded.
+  \item Measurement window: 300 seconds.
+  \item Per-RPC timestamps captured with \texttt{rdtsc} (calibrated)
+        on issuer thread; clock-skew corrected per connection.
+  \item Report median, $p95$, $p99$, $p999$, and max.
+  \item Repeat 5 runs; report median across runs and 95\%\ CI.
+  \item Congestion test: inject competing 5\,Gbps iperf flow on the
+        same NIC; remeasure tails.
+\end{enumerate}
+
+\subsection{Compared protocols}
+gRPC over HTTP/2 with Protobuf~\cite{grpc,rfc9113}, raw HTTP/2 with
+JSON, Protobuf over QUIC~\cite{rfc9000}, and native ZAP. Each
+implementation is the canonical open-source reference and is run with
+its own client. Allocators are pinned (\texttt{jemalloc}) for fairness.
+
+\section{Predicted Results}
+\label{sec:results}
+
+\Cref{tab:predicted} summarizes the headline numbers. Speedups are
+ratios of the comparator's $p99$ latency to ZAP's $p99$ latency.
+Numbers are calibrated against published Cap'n Proto vs Protobuf
+ratios~\cite{capnproto-bench} and warehouse-scale tail
+data~\cite{xu2024microsecond}.
+
+\begin{table}[h]
+\centering
+\caption{Predicted $p99$ latency speedup of ZAP over comparators.}
+\label{tab:predicted}
+\begin{tabular}{lcccc}
+\toprule
+Workload & vs JSON/H2 & vs gRPC/H2 & vs PB/QUIC & ZAP $p99$ ($\mu$s) \\
+\midrule
+Small (64\,B, 8 fields)  & $9$--$14\times$ & $3.5$--$6\times$ & $2.5$--$4\times$ & $8\pm1$ \\
+Medium (4\,KiB, 64 f.)   & $7$--$11\times$ & $4$--$7\times$   & $3$--$5\times$   & $22\pm3$ \\
+Large (256\,KiB)         & $3$--$5\times$  & $1.6$--$2.2\times$ & $1.3$--$1.7\times$ & $310\pm15$ \\
+Streaming 100\,k msg/s   & $6$--$9\times$  & $3$--$4\times$   & $2.5$--$3.5\times$ & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Tail behavior under congestion}
+We expect Protobuf/HTTP-2 $p999$ to inflate by $4$--$8\times$ under the
+competing iperf flow due to HPACK dynamic-table eviction and
+HOL blocking. ZAP over QUIC streams should inflate by $1.5$--$2.5\times$.
+
+\section{When ZAP Does Not Win}
+\label{sec:caveats}
+
+We are obliged to report negative regimes:
+\begin{itemize}
+  \item \textbf{Tiny single-field messages.} A 1-field 8-byte payload
+        is dominated by transport headers; the per-message constant in
+        ZAP (segment header, root pointer) costs about 16 bytes that
+        Protobuf can compress with HPACK if reused.
+  \item \textbf{Environments without zero-copy mmap.} On platforms that
+        cannot expose contiguous arenas (some embedded RTOSes, certain
+        WebAssembly runtimes pre-memory64), ZAP loses its main
+        advantage and falls back to a conventional copy.
+  \item \textbf{Highly heterogeneous schemas.} If consumers share the
+        wire but not the schema, ZAP's positional layout is fragile
+        across versions; protobuf's tag-based skip-on-unknown is
+        easier to live with operationally.
+  \item \textbf{Small-bandwidth high-RTT links.} When $L_{\textit{net}}$
+        dominates ($\rho \gg L_{\textit{ser}}+L_{\textit{de}}$), wire format choice
+        is nearly invisible.
+\end{itemize}
+
+\section{Discussion: PQ Handshake Amortization}
+\label{sec:pq}
+
+A post-quantum KEM handshake (X25519 hybridized with ML-KEM-768)
+costs roughly $1$--$2$\,ms once. Amortized over a connection that
+serves $10^5$ RPCs, the per-RPC overhead is $10$--$20$\,ns, well below
+ZAP's per-RPC fixed cost. Long-lived ZAP connections therefore eat
+the PQ handshake exactly once, in contrast to short-lived gRPC
+connections that may pay it on every TLS resume failure.
+
+\section{Related Work}
+\label{sec:related}
+
+Cap'n Proto~\cite{capnproto} originated the zero-copy arena design.
+FlatBuffers~\cite{flatbuffers} adopted the same idea with a
+read-only emphasis. Protocol Buffers~\cite{protobuf} and
+Avro~\cite{avro} pay tag-length-value cost in exchange for
+schema-evolution flexibility. MessagePack~\cite{msgpack} is JSON-like
+but binary, with similar parsing cost.
+HTTP/2~\cite{rfc9113} and QUIC~\cite{rfc9000} attack the transport
+layer but leave the encoding layer to the application.
+FaSST~\cite{kalia2016fasst} and Snap~\cite{marty2019snap}
+demonstrate that, with kernel-bypass and careful encoding, RPC
+latency can reach single-digit microseconds; our work targets the
+encoding contribution to that budget.
+The classical parser-cost analysis of Aho and Ullman~\cite{ahoullman1972}
+underpins our serialization-cost lower bounds.
+The ``numbers every programmer should know'' list~\cite{deannumbers}
+calibrates our model's constants.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+The serialization tax is real, measurable, and avoidable. ZAP's
+zero-copy wire format collapses serialization and deserialization to
+constant time in field count, which translates to predictable tail
+latency and near-link-rate throughput. We have presented a formal
+model, two theorems with proofs in a companion document, and a
+reproducible benchmark methodology. The remaining work is empirical:
+running these benchmarks across a representative hardware matrix and
+publishing the raw distributions.
+
+\printbibliography
+
+\end{document}
