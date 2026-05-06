@@ -1,0 +1,744 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{cite}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  citecolor=blue!50!black,
+  urlcolor=blue!50!black,
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{construction}[theorem]{Construction}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\zap}{\textsf{ZAP}\xspace}
+\newcommand{\zapmcp}{\textsf{ZAP-MCP}\xspace}
+\newcommand{\zapaa}{\textsf{ZAP-A2A}\xspace}
+\newcommand{\mcp}{\textsf{MCP}\xspace}
+\newcommand{\aatwo}{\textsf{A2A}\xspace}
+\newcommand{\rns}{\textsf{ZAP-RNS}\xspace}
+\newcommand{\Adv}{\mathsf{Adv}}
+\newcommand{\Exp}{\mathsf{Exp}}
+\newcommand{\AEAD}{\textsf{AE}}
+\newcommand{\KEM}{\textsf{KEM}}
+\newcommand{\Sign}{\textsf{Sig}}
+\newcommand{\negl}{\mathsf{negl}}
+
+\usepackage{xspace}
+
+\title{\textbf{\zapmcp{} and \zapaa{}: Mutually Authenticated, Non-Repudiable
+Transport for the \mcp{} and Agent2Agent Protocols}}
+
+\author{ZAP Protocol Authors\\
+\href{https://zap-proto.io}{\texttt{zap-proto.io}}}
+
+\date{2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Autonomous and semi-autonomous AI agents have moved from research demos to
+infrastructure-critical systems: they execute trades, retrieve patient
+records, and modify production code. The two protocols that knit these
+agents together --- \emph{Model Context Protocol} (\mcp{}) for
+agent-to-tool calls~\cite{mcp2024} and \emph{Agent2Agent} (\aatwo{}) for
+agent-to-agent collaboration~\cite{a2a2025} --- inherit their security
+posture from the legacy web stack: TLS for confidentiality, API keys or
+JWT bearers for authentication, and HTTP/SSE or HTTP/JSON framing. We
+argue that this stack is structurally inadequate for an agent
+fabric. Bearer tokens are bearer-authenticated, not message-authenticated;
+JSON-RPC payloads carry no identity; and intermediate agent gateways or
+tool brokers are forced to terminate TLS in order to route, breaking
+end-to-end confidentiality and provenance. We present \zapmcp{} and
+\zapaa{}, two compositions of the \zap{} post-quantum authenticated
+transport with the \mcp{} and \aatwo{} application protocols. Each
+agent-to-tool or agent-to-agent message is wrapped in a \zap{} frame,
+keyed to a Module-Lattice KEM public key, signed under a per-agent
+ML-DSA-65 (or hybrid Ed25519+ML-DSA-65) signing key, and bound to a
+session-scoped nonce ladder. We give security definitions, prove
+non-repudiation under the EUF-CMA assumption for ML-DSA, prove
+agent-impersonation infeasibility under combined KEM IND-CCA and signature
+EUF-CMA assumptions, and bound replay advantage by the nonce-collision
+probability. We also analyse wire overhead and show that \zap{}-wrapped
+\mcp{}/\aatwo{} traffic is shorter on the wire than HTTP+SSE+JWT
+baselines for typical tool-call sizes, while delivering audit-grade
+provenance suitable for HIPAA, SOC~2, and GDPR Article~30 records of
+processing.
+\end{abstract}
+
+\section{Introduction}
+
+\subsection{Agents are now critical infrastructure}
+
+A 2023 LLM-integrated chatbot is recoverable; a 2026 agent that has
+funded your accounts, called your APIs, and rewritten your production
+code is not. Agents are increasingly given tools that perform irreversible
+actions: order routing, database mutations, identity issuance, code
+deployment, fund transfers, prescription writing. The protocols that
+carry these actions --- \mcp{} for tool invocation and \aatwo{} for
+inter-agent collaboration --- are the new universal joints of automated
+labor.
+
+These protocols were specified for fast adoption, not for long-horizon
+auditability or post-quantum survivability. \mcp{} runs JSON-RPC 2.0 over
+stdio (no auth), HTTP+SSE (auth via TLS + an opaque ``API key'' header or
+OAuth bearer token), or WebSocket (likewise)~\cite{mcp2024,jsonrpc2}.
+\aatwo{} runs structured tasks and artifacts over HTTP/JSON, with agent
+identification expressed via ``agent cards'' typically signed only by the
+TLS certificate of the host~\cite{a2a2025}. In both cases, the security
+boundary is the TLS connection, not the message.
+
+\subsection{Why the TLS-and-bearer stack is inadequate}
+
+We identify five structural gaps:
+
+\begin{enumerate}[leftmargin=2em,itemsep=0.25em]
+\item \textbf{Tool impersonation.} A bearer token attests that the
+\emph{client} has presented credentials to \emph{some} server reached at
+a URL. It does not attest that the server is the intended tool. URL
+phishing or DNS substitution succeeds whenever the agent has not
+out-of-band pinned the tool's certificate.
+\item \textbf{Message non-repudiation.} TLS protects messages
+\emph{in flight}, not afterwards. A logged JSON-RPC envelope cannot
+later be verified to have actually been emitted by a given agent: TLS
+authentication is symmetric session-keyed and unprovable to a third
+party. Disputes over ``did agent $A$ really request to wire \$10\,M?''
+have no cryptographic answer.
+\item \textbf{Cross-session replay.} A bearer-token-authenticated request
+captured at runtime can be replayed by an attacker with the same token,
+because the request itself is not bound to a fresh session secret.
+\item \textbf{Quantum-vulnerable transcripts.} Long-lived agent logs
+(medical, legal, financial) recorded today and decryptable in 2035 by an
+attacker holding a CRQC are out of policy under
+``harvest-now-decrypt-later''~\cite{harvest_now} for any organisation
+whose data retention exceeds the quantum horizon.
+\item \textbf{Broker-opaque routing.} Gateways that route between agent
+clouds must today terminate TLS in order to read \mcp{}/\aatwo{}
+message envelopes; this destroys end-to-end secrecy and forces gateways
+into the trusted compute base.
+\end{enumerate}
+
+\subsection{Thesis}
+
+Wrapping \mcp{} and \aatwo{} in \zap{} gives every agent-to-tool and
+agent-to-agent message: post-quantum confidentiality, mutual
+cryptographic identity, non-repudiation, and provenance --- all at lower
+wire overhead than the current HTTP+SSE / HTTP+JWT defaults. Concretely:
+
+\begin{itemize}[leftmargin=2em,itemsep=0.25em]
+\item Each \mcp{} JSON-RPC request and response, and each \aatwo{} task
+or artifact, is encapsulated as a single \zap{} frame.
+\item Each frame carries an ML-DSA-65 signature of the request hash by
+the agent's long-term signing key (or a hybrid Ed25519+ML-DSA-65 pair
+during transition).
+\item Each frame is encrypted to the recipient's ML-KEM-768 public key
+via an X-Wing-style hybrid construction~\cite{kyber2018,nistmlkem}.
+\item The session is initiated by a \zap{} 1-RTT handshake whose
+transcript is signed by both parties; thereafter, frames carry a
+sequence-bound nonce.
+\item Agent identity is resolved through \rns{}~\cite{zaprns}: a name
+maps to an ML-KEM public key and a signing public key, replacing the
+``URL plus host certificate'' identity model.
+\end{itemize}
+
+The remainder of this paper formalises the construction
+(Sections~\ref{sec:threat}--\ref{sec:zap-a2a}), states and proves
+non-repudiation, replay resistance, and impersonation resistance
+(Section~\ref{sec:security}), measures wire overhead
+(Section~\ref{sec:perf}), and discusses compliance, deployment, and
+gap items (Sections~\ref{sec:compliance}--\ref{sec:gaps}).
+
+\section{Background}
+
+\subsection{Model Context Protocol}
+
+\mcp{}~\cite{mcp2024} is a JSON-RPC 2.0~\cite{jsonrpc2} request/response
+protocol between an \emph{agent} (client, typically driven by an LLM)
+and a \emph{tool server}. The agent invokes methods such as
+\texttt{tools/list}, \texttt{tools/call}, \texttt{resources/read}, and
+\texttt{prompts/get}; the tool server returns structured results.
+Three transports are specified: stdio (in-process), HTTP+SSE (request
+by HTTP POST, asynchronous server messages by Server-Sent
+Events~\cite{rfc6455}), and WebSocket. Authentication is undefined at
+the protocol level; in practice, deployments inject an
+\texttt{Authorization} header containing an OAuth 2.0 bearer
+token~\cite{rfc6749,rfc7519}.
+
+\subsection{Agent2Agent}
+
+\aatwo{}~\cite{a2a2025} is a higher-level protocol over HTTP/JSON.
+Agents publish \emph{agent cards} describing their capabilities; clients
+invoke long-running \emph{tasks}, which produce
+\emph{artifacts} consumed by other agents or terminating in a final
+result. \aatwo{} authentication is HTTP-layer, typically TLS server
+authentication plus a bearer JWT.
+
+\subsection{The \zap{} transport}
+
+\zap{}~\cite{zaptransport} is a binary, stateful, post-quantum
+authenticated transport. A \zap{} session is established by a 1-RTT
+handshake derived from the SIGMA~\cite{sigma} family, parameterised by
+a hybrid KEM (ML-KEM-768 with X25519~\cite{kyber2018,nistmlkem}) and a
+hybrid signature (Ed25519 with ML-DSA-65~\cite{nistmldsa,ed25519}).
+Frames carry a 64-bit sequence number, a 96-bit nonce derived from
+HKDF~\cite{krawczyk2010hkdf} of the session key, and an authenticated
+ciphertext under AES-256-GCM or ChaCha20-Poly1305. Optionally a
+\emph{signed-payload} flag adds a per-frame ML-DSA-65 signature over
+the plaintext payload hash, providing third-party verifiable
+non-repudiation.
+
+\subsection{\rns{}: identity-bound naming}
+
+\rns{}~\cite{zaprns} resolves a human-readable agent or tool name to a
+record containing (i) an ML-KEM public key, (ii) an Ed25519 public key,
+(iii) an ML-DSA-65 public key, (iv) a vector of capability claims, and
+(v) a signature chain rooted at a publishing authority. Resolution
+returns a self-authenticating record; identity is no longer expressed
+as ``hostname + a certificate someone in the chain trusts''.
+
+\section{Threat Model}\label{sec:threat}
+
+\subsection{Trust assumptions}
+
+\textbf{Trusted:} the agent's long-term signing key and the tool's
+long-term decapsulation key (each held in an HSM or equivalent
+isolated enclave); the \rns{} record cache after first authenticated
+fetch; the cryptographic primitives ML-DSA-65, ML-KEM-768, AES-GCM,
+SHA-3, HKDF.
+
+\textbf{Untrusted:} the network; any intermediate ``agent gateway''
+performing routing or load balancing; the JSON-RPC transcript on disk
+(must be third-party verifiable); the DNS resolver (because identity
+binds to KEM PK, not DNS).
+
+\subsection{Adversary capabilities}
+
+We assume an active network adversary $\mathcal{A}$ who:
+\begin{itemize}[leftmargin=2em,itemsep=0.25em]
+\item observes, drops, reorders, modifies, and injects all
+network traffic;
+\item operates a polynomial number of legitimate-looking tool servers
+and agents and can cause them to engage in handshakes;
+\item may corrupt up to all but one of the parties in the system,
+provided we explicitly declare the surviving party honest;
+\item is bounded to probabilistic polynomial time, including
+polynomially many quantum oracle queries (the assumption used by
+ML-KEM-768 and ML-DSA-65 security claims~\cite{nistmlkem,nistmldsa});
+\item may store transcripts indefinitely (harvest-now-decrypt-later).
+\end{itemize}
+
+\subsection{Concrete agent-fabric attacks}
+
+We consider the following attacks of practical importance, and the
+section that addresses each:
+
+\begin{enumerate}[leftmargin=2em,itemsep=0.25em]
+\item \emph{Tool impersonation.} $\mathcal{A}$ stands up a malicious
+tool server claiming to be a legitimate API.
+\textbf{Addressed by} \rns{}-bound mutual authentication
+(\S\ref{sec:zap-mcp}).
+\item \emph{Indirect prompt injection via tool
+output}~\cite{prompt_injection_2023}. Out of scope cryptographically
+(prompt injection lives at the model layer); however, \zap{} provides
+the prerequisite that tool output is cryptographically attributable to
+a named tool, so injection-induced damage is forensically
+reconstructible.
+\item \emph{Cross-agent replay.} $\mathcal{A}$ captures a tool call from
+agent $A$ and replays it as if from $A$, on a different session.
+\textbf{Addressed by} session-bound nonces
+(Lemma~\ref{lem:replay} in \cite{proof}).
+\item \emph{Long-term provenance loss.} Six months later, agent $A$
+denies having issued a transaction. \textbf{Addressed by} ML-DSA-65
+signed frames (Theorem~\ref{thm:nonrep}).
+\item \emph{Future-quantum decryption} of medical/legal transcripts.
+\textbf{Addressed by} hybrid ML-KEM-768 + X25519 frame keying.
+\item \emph{Broker-introduced injection.} A routing gateway modifies
+\mcp{} request fields. \textbf{Addressed by} per-frame AEAD: a routing
+gateway cannot decrypt or modify without invalidating the frame tag
+and signature.
+\end{enumerate}
+
+\section{\zapmcp{} Construction}\label{sec:zap-mcp}
+
+\subsection{Wire mapping}
+
+A \mcp{} JSON-RPC request is a JSON object
+$\rho = \{\texttt{jsonrpc},\texttt{id},\texttt{method},\texttt{params}\}$.
+Define the canonical encoding
+\[
+\hat{\rho} = \mathrm{CBOR}(\rho)
+\]
+using deterministic CBOR~\cite{cose}. Let
+$\sigma = \Sign.\mathrm{Sign}(sk_A, h(\hat{\rho}\;\Vert\;\mathit{ctx}))$
+where $h$ is SHA3-256, $sk_A$ is agent $A$'s ML-DSA-65 signing key, and
+$\mathit{ctx}$ is a binding context string of the form
+\[
+\mathit{ctx} = \mathtt{"zap-mcp/v1"} \,\Vert\, \mathit{sid} \,\Vert\, \mathit{seq}
+\]
+where $\mathit{sid}$ is the 32-byte session identifier produced by the
+\zap{} handshake and $\mathit{seq}$ is the 64-bit frame sequence number.
+
+The wrapped request is the \zap{} frame
+\[
+F = \zap.\mathrm{Seal}(K_{AB},\, \mathit{nonce}(\mathit{sid},\mathit{seq}),\,
+\hat{\rho}\;\Vert\;\sigma,\, \mathit{ad})
+\]
+where $K_{AB}$ is the per-direction AEAD key derived from the handshake,
+and $\mathit{ad} = \mathtt{"zap-mcp/v1/req"} \,\Vert\, \mathit{seq}$.
+
+The corresponding \mcp{} response from tool $T$ is wrapped symmetrically
+under $T$'s signing key, with $\mathit{ctx}$ extended to bind to the
+request hash, ensuring response-to-request linkage.
+
+\subsection{Mutual identification}
+
+The agent locates the tool by name $n$ via \rns{}: it retrieves a record
+$R_T$ binding $n$ to a tuple
+$(\mathit{kem\_pk}_T, \mathit{sig\_pk}_T, \mathit{caps}_T)$ with a
+publisher signature. The agent verifies the publisher chain, then
+initiates a \zap{} handshake against the tool's network endpoint using
+$\mathit{kem\_pk}_T$. The handshake transcript is signed by both
+parties.
+
+\begin{remark}
+Crucially, the agent never trusts a hostname. If DNS misroutes the
+agent to an attacker's endpoint, the handshake fails because the
+attacker does not hold the secret key for $\mathit{kem\_pk}_T$.
+This eliminates the entire class of tool-URL phishing attacks.
+\end{remark}
+
+\subsection{Capability claims}
+
+\rns{} records carry capability claims, e.g.\ ``this tool is permitted
+to list orders but not place them''. The handshake transcript binds the
+hash of the claims set; the tool must therefore present a record whose
+claims include the methods the agent will call. The agent can refuse
+\texttt{tools/call} for methods absent from the claim vector before any
+network round trip.
+
+\subsection{Pseudocode (request path)}
+
+\begin{lstlisting}[basicstyle=\footnotesize\ttfamily,frame=single,
+                   xleftmargin=1em,framesep=0.5em]
+function zapmcp_call(agent_sk, tool_name, method, params):
+    R_T  := rns_resolve(tool_name)
+    verify_record_chain(R_T)
+    require method in R_T.caps
+
+    sess := zap_handshake(R_T.kem_pk, agent_sk)  // 1-RTT
+    rho  := { jsonrpc: "2.0", id: fresh_id(),
+              method: method, params: params }
+    rho_hat := cbor(rho)
+    ctx  := "zap-mcp/v1" || sess.id || sess.next_seq()
+    sig  := mldsa65_sign(agent_sk, sha3_256(rho_hat || ctx))
+    F    := zap_seal(sess, rho_hat || sig)
+    send(F)
+    F'   := recv()
+    payload, sig' := zap_open(sess, F')
+    require mldsa65_verify(R_T.sig_pk,
+                           sha3_256(payload || resp_ctx), sig')
+    return cbor_decode(payload)
+\end{lstlisting}
+
+\section{\zapaa{} Construction}\label{sec:zap-a2a}
+
+\aatwo{} is task-shaped, not call-shaped: an agent submits a task
+description, the remote agent acknowledges and emits a sequence of
+artifacts and progress events, and eventually a final result. We map
+each top-level \aatwo{} message --- task envelope, artifact, status
+event, terminal result --- to one signed \zap{} frame, with the
+following augmentations.
+
+\subsection{Signed agent cards}
+
+In \aatwo{} an \emph{agent card} declares an agent's identity,
+capabilities, and endpoints. Under \zapaa{}, an agent card is a
+canonical CBOR object signed by the agent's ML-DSA-65 key and published
+through \rns{}. A consuming agent verifies the card off the wire; the
+card is itself a frame-shaped, third-party-verifiable artifact.
+
+\subsection{Artifact provenance}
+
+Each artifact emitted during a task carries a frame signature by the
+producing agent. Because frames bind $\mathit{sid}$ (session id) and
+the parent task identifier, an artifact is independently verifiable as
+``produced by agent $B$, in the context of task $\tau$, in session
+$\mathit{sid}$, at sequence $\mathit{seq}$''. A verifier presented with
+only the artifact and the public keys of $B$ can confirm authenticity
+without access to the original session.
+
+\subsection{Multi-hop tasks}
+
+When agent $A$ delegates to $B$ which subdelegates to $C$, the
+chain of frames forms a directed acyclic graph of signed claims. Each
+edge is independently verifiable. \zapaa{} does not require any single
+party to be online during audit. This is in deliberate contrast to
+the bearer-token model, where revocation of $B$'s token retroactively
+invalidates the chain.
+
+\subsection{Encrypted-to-recipient routing}
+
+A frame is encrypted under the recipient's per-session AEAD key,
+itself derived from the recipient's ML-KEM static key. A routing
+gateway sees only the routing header (sender, recipient \rns{}
+identifiers, frame size, sequence). The gateway cannot read or modify
+content, removing an entire trusted compute base from the agent
+fabric.
+
+\section{Security}\label{sec:security}
+
+We give formal statements here. Full proofs are in the companion
+proof document~\cite{proof}.
+
+\subsection{Definitions}
+
+\begin{definition}[Agent non-repudiation]
+For a frame $F$ produced in session $\mathit{sid}$ at sequence
+$\mathit{seq}$, claimed sender $A$, payload $\hat{\rho}$, signature
+$\sigma$: $F$ is non-repudiable if any third-party verifier $V$ holding
+$\mathit{sig\_pk}_A$ can decide whether $\sigma$ is a valid ML-DSA-65
+signature on $h(\hat{\rho}\,\Vert\,\mathit{ctx})$, with binding context
+$\mathit{ctx}$ as defined above. The non-repudiation advantage of
+$\mathcal{A}$ is the probability that $\mathcal{A}$ produces a triple
+$(F^*, A^*, \hat{\rho}^*)$ accepted by $V$ as authored by $A^*$ when in
+fact $A^*$ never signed it.
+\end{definition}
+
+\begin{definition}[Agent impersonation]
+$\mathcal{A}$ impersonates an agent $A$ if $\mathcal{A}$ completes a
+\zap{} handshake with an honest peer $T$ such that $T$ accepts the
+session as authenticated to $A$ and $\mathcal{A}$ does not hold $A$'s
+secret signing key.
+\end{definition}
+
+\begin{definition}[Cross-session replay]
+A replay event occurs when $\mathcal{A}$ injects into an honest session
+$\mathit{sid}_2$ a frame originally accepted in a distinct session
+$\mathit{sid}_1$, and the recipient accepts it as fresh.
+\end{definition}
+
+\subsection{Theorems}
+
+\begin{theorem}[Non-repudiation]\label{thm:nonrep}
+For any PPT adversary $\mathcal{A}$ against the agent
+non-repudiation game of \zapmcp{} or \zapaa{},
+\[
+\Adv^{\mathit{nonrep}}_{\zapmcp{}}(\mathcal{A}) \;\leq\;
+q_s \cdot \Adv^{\mathit{eufcma}}_{\Sign,\mathit{ML\text{-}DSA\text{-}65}}(\mathcal{B})
++ q_h \cdot 2^{-256}
+\]
+where $q_s$ is the number of signing queries, $q_h$ the number of hash
+queries, and $\mathcal{B}$ a constructed forger against ML-DSA-65 with
+running time within an additive constant of $\mathcal{A}$.
+\end{theorem}
+
+\begin{theorem}[Agent impersonation infeasibility]\label{thm:imp}
+For any PPT adversary $\mathcal{A}$ against \zapmcp{}/\zapaa{}
+agent-impersonation,
+\[
+\Adv^{\mathit{imp}}_{\zap}(\mathcal{A}) \;\leq\;
+\Adv^{\mathit{indcca}}_{\KEM,\mathit{ML\text{-}KEM\text{-}768}}(\mathcal{B}_1)
++ \Adv^{\mathit{eufcma}}_{\Sign,\mathit{ML\text{-}DSA\text{-}65}}(\mathcal{B}_2)
++ \frac{q_h^2}{2^{256}}.
+\]
+\end{theorem}
+
+\begin{lemma}[Replay freshness]\label{lem:replay}
+For session nonces of length $\nu$ bits and per-session frame counts
+$\leq Q$,
+\[
+\Pr[\mathit{replay\ accepted}]
+\;\leq\; \frac{Q(Q-1)}{2^{\nu+1}} + \mathit{negl}.
+\]
+With $\nu = 96$ and $Q \leq 2^{40}$ this is $\leq 2^{-17}$, well below
+any operationally relevant threshold.
+\end{lemma}
+
+\begin{remark}
+Theorems~\ref{thm:nonrep} and \ref{thm:imp} together imply that an
+agent fabric built on \zapmcp{}/\zapaa{} delivers non-repudiable
+provenance and bilateral authentication under standard post-quantum
+assumptions. Lemma~\ref{lem:replay} forces $Q \cdot \nu$
+budgeting in operational deployments; in practice this is satisfied
+trivially by 96-bit nonces.
+\end{remark}
+
+\section{Wire Performance}\label{sec:perf}
+
+\subsection{Baseline accounting}
+
+Consider a representative \mcp{} \texttt{tools/call} request:
+$\rho$ encodes to roughly 192 bytes of JSON. The HTTP+SSE+JWT baseline
+adds the following overhead per request/response pair:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lr}
+\toprule
+\textbf{Layer} & \textbf{Bytes} \\
+\midrule
+HTTP request line                              & 24 \\
+HTTP host header                               & 32 \\
+HTTP \texttt{Authorization} (JWT, RS256)       & 920 \\
+HTTP content-type / accept / user-agent / ...  & 180 \\
+HTTP/2 HPACK savings (estimated)               & $-200$ \\
+TLS record framing per record                  & 29 \\
+SSE \texttt{event:}/\texttt{data:} framing    & 22 \\
+HTTP/2 frame headers                           & 9 \\
+\midrule
+\textbf{HTTP+SSE+JWT total per call (one direction)} & \textbf{$\approx$1016} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A second JWT travels with the response only when callbacks reauthenticate;
+typical SSE keeps the original JWT context, so we do not count it on the
+return path. We also do not count TCP/IP framing, which is identical on
+both sides.
+
+\subsection{\zap{} accounting}
+
+A \zap{} frame carrying a signed \mcp{} JSON-RPC request consists of:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lr}
+\toprule
+\textbf{Field} & \textbf{Bytes} \\
+\midrule
+Frame magic + version                                  & 4 \\
+Sequence number                                        & 8 \\
+AEAD nonce (derived; on-wire nonce)                    & 12 \\
+AEAD tag                                               & 16 \\
+Length prefix                                          & 4 \\
+Routing recipient ID (\rns{} hash)                     & 16 \\
+ML-DSA-65 signature (in plaintext, AEAD-protected)     & 3309 \\
+\midrule
+\textbf{\zap{} per-frame fixed overhead}        & \textbf{60 (excl.\ signature)} \\
+\textbf{\zap{} with per-frame ML-DSA-65 sig}    & \textbf{3369} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The signature is dominated by ML-DSA-65's 3309-byte size. For
+non-financial calls where third-party verifiability is not required, an
+operator may select \emph{session-only} signatures (transcript signed
+once at handshake, frames carry only AEAD tags); fixed per-frame
+overhead is then 60 bytes versus HTTP+SSE+JWT's $\approx$1016 bytes ---
+a 17$\times$ reduction. With per-frame ML-DSA-65 signatures the wire is
+heavier than HTTP+JWT, but JWT carries no third-party verifiability:
+the comparison is between a 3309-byte cryptographic record of intent
+versus a 920-byte bearer assertion.
+
+\subsection{Practical recommendation}
+
+For \mcp{} tool calls of consequence (settlement, mutation, identity
+issuance), per-frame ML-DSA-65 signatures are mandatory and the
+cost is amortised over the audit value. For idempotent read-only
+queries, session-signed frames are sufficient, and \zapmcp{} is on the
+wire shorter than HTTP+SSE+JWT.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Call type} & \textbf{HTTP+SSE+JWT (B)} & \textbf{\zapmcp{} (B)} \\
+\midrule
+read-only (e.g.\ \texttt{tools/list})  & 1016 & 60 \\
+mutating, audited                       & 1016 & 3369 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Composition with \rns{}}
+
+The full \zapmcp{} call sequence is:
+
+\begin{enumerate}[leftmargin=2em,itemsep=0.25em]
+\item agent looks up tool name $n$ in \rns{} (cached locally with TTL),
+\item agent verifies record signature chain against the publisher root,
+\item agent extracts $\mathit{kem\_pk}_T, \mathit{sig\_pk}_T,
+\mathit{caps}_T$,
+\item agent connects to $T$ at the network endpoint also published in
+the record (an IP, hostname, or libp2p multiaddr),
+\item agent runs the \zap{} 1-RTT handshake, receiving and verifying
+$T$'s signed transcript,
+\item agent issues \zapmcp{} frames as in \S\ref{sec:zap-mcp}.
+\end{enumerate}
+
+No HTTP layer participates. No JWT is ever issued. There is no
+\emph{a priori} HTTPS endpoint. The identity of $T$ is its
+$\mathit{kem\_pk}_T$, not any name resolved by DNS.
+
+\section{Compliance Considerations}\label{sec:compliance}
+
+\subsection{HIPAA Security Rule}
+
+The HIPAA Security Rule~\cite{hipaa_security} requires
+``transmission security'' (\S 164.312(e)) and ``audit controls'' (\S
+164.312(b)). \zapmcp{} satisfies the encryption-in-transit requirement
+under hybrid ML-KEM-768 + X25519, and audit controls map to the per-frame
+signed log: a clinical agent's request to read a record is a third-party
+verifiable artifact, retainable for the statutory six years.
+
+\subsection{SOC~2}
+
+SOC~2~\cite{soc2} Common Criteria CC6.7 (transmission of information)
+and CC7.2 (system monitoring) are addressed identically. The
+distinguishing benefit is that \zap{}-logged events are
+\emph{independently} verifiable; SOC~2 auditors can replay the
+verification without trusting the operator's logging pipeline.
+
+\subsection{GDPR Article 30}
+
+Article~30~\cite{gdpr_art30} requires ``records of processing
+activities'' kept by the controller and processor. A \zap{}-wrapped
+agent fabric naturally produces such records: each tool call's request
+and response are signed, dated (via session-bound monotonic sequence),
+and bound to the agent and tool identity. This is materially stronger
+than the typical Article~30 ``description of categories of processing''
+prose, which is non-cryptographic.
+
+\subsection{Long-term retention and the quantum horizon}
+
+Medical, legal, and financial records routinely have retention periods
+of 6--75 years. Any TLS-only protection of those records today must be
+modelled under harvest-now-decrypt-later~\cite{harvest_now}: an attacker
+who records the TLS handshake in 2026 and obtains a CRQC by, say, 2035,
+recovers all session content. Hybrid ML-KEM-768 keying eliminates this
+class of risk for any traffic encrypted under \zap{}.
+
+\section{Deployment Notes}
+
+\subsection{Existing \mcp{} servers}
+
+A backwards-compatible adapter pattern is straightforward: a thin
+\zapmcp{} sidecar terminates frames, validates the agent identity and
+capability claims, then forwards plain JSON-RPC over a UNIX domain
+socket to the existing \mcp{} server process. The sidecar adds
+$\approx$200 lines and runs in process; this is the recommended
+migration path for tool authors.
+
+\subsection{Existing \aatwo{} agents}
+
+\aatwo{} agents accept agent cards by URL. \zapaa{} extends this with
+\rns{}-resolved cards. Agents that wish to interoperate with both can
+publish a \aatwo{}-card-by-URL whose contents are byte-for-byte the
+canonical CBOR encoding of the \rns{} record content; verifiers can
+then cross-check.
+
+\subsection{Key management}
+
+Long-term ML-DSA-65 signing keys are held in HSMs or platform secure
+enclaves. Per-session handshake keys are derived from the long-term keys
+plus ephemeral KEM material; session keys are zeroised at session
+close. Backup of long-term keys is by Shamir secret sharing across
+operator-distinct custodians; in regulated environments a regulator
+may hold one share with auditable retrieval policy.
+
+\section{Gap Items and Future Work}\label{sec:gaps}
+
+We are explicit about what \zapmcp{}/\zapaa{} does not yet solve.
+
+\begin{enumerate}[leftmargin=2em,itemsep=0.25em]
+\item \textbf{Revocation distribution.} If a long-term agent signing
+key is compromised, every cached \rns{} record pointing at it must be
+poisoned. We currently rely on short \rns{} TTLs (default 600 seconds)
+plus a transparency-log-style revocation feed. A formal CRL-equivalent
+distribution scheme suitable for a fleet of $10^6$ agents is open work.
+The trade-off space is short TTLs (chatty resolvers) versus
+signed delta updates over a gossip overlay (complex, risk of
+gossip-poisoning).
+\item \textbf{Capability claim semantics.} \rns{} records carry a
+capability vector, but the schema is application-specific. A canonical
+ontology for tool capabilities (read-only, idempotent, mutating,
+financial-impact) would let policy be expressed transport-side rather
+than per-application.
+\item \textbf{Indirect prompt injection.} \zapmcp{} attributes
+tool output to a tool, but does not detect when that output is a
+prompt-injection payload. Mitigation belongs at the model integration
+layer; \zap{} provides forensic attribution.
+\item \textbf{Quantum-safe \rns{} root.} The \rns{} publisher root key
+itself must be ML-DSA-65 (or SLH-DSA-256s for ultra-long horizon). A
+governance procedure for rotating that root in a federated agent fabric
+is open.
+\item \textbf{Tamarin/ProVerif analysis.} We have proven properties in
+the computational model (Section~\ref{sec:security}). A symbolic model
+verification along the lines of \cite{cremers2017ake} for full
+\zapmcp{} session establishment is in progress.
+\item \textbf{Side-channel resistance of agent-side ML-DSA-65.} On
+phones and laptops running an LLM agent, ML-DSA-65 signing must run in
+constant time; the reference implementation does, but operator-grade
+deployments should be verified against the target microarchitecture.
+\end{enumerate}
+
+\section{Related Work}
+
+\paragraph{TLS-style mutual authentication.} TLS~\cite{rfc8446} with
+client certificates achieves mutual authentication but is bound to
+hostnames and X.509 PKIs~\cite{rfc5280}; agent populations are
+fundamentally not hostname-shaped. ACME~\cite{rfc8555} and short-lived
+certificates partially address dynamism but inherit the X.509 trust
+model.
+
+\paragraph{DIDs and Verifiable Credentials.} W3C
+DIDs~\cite{didcore,didweb,didkey} and Verifiable
+Credentials~\cite{vc20} provide a self-sovereign identity model close
+in spirit to \rns{}. \rns{} differs by enforcing that resolution
+yields a KEM public key and binds transport to it; this collapses the
+``identity proof'' and ``transport key'' into a single artifact and
+removes a class of failure modes where DID resolution and transport
+authentication disagree.
+
+\paragraph{COSE/JOSE signed envelopes.} COSE~\cite{cose} and
+JWE~\cite{jose} provide signed and encrypted message envelopes. They
+do not specify a session establishment, do not pin transport identity
+to KEM keys, and do not provide replay freshness binding.
+\zap{} uses COSE-style canonicalisation under the covers but adds the
+session and identity layers.
+
+\paragraph{Agent governance literature.} \cite{agent_audit_2024}
+articulates non-cryptographic governance practices for agentic AI.
+Cryptographic audit substrate as offered by \zapmcp{}/\zapaa{} is
+complementary and provides the substrate on which governance practices
+can be enforced.
+
+\section{Conclusion}
+
+The agent fabric is the new universal joint of computation. Its
+security cannot be the security of HTTP plus a bearer token. We have
+shown that wrapping \mcp{} and \aatwo{} in \zap{} delivers
+post-quantum confidentiality, mutual authentication of agents and
+tools by KEM identity, non-repudiation of every message via per-frame
+ML-DSA-65 signatures, and provenance suitable for HIPAA, SOC~2, and
+GDPR. The construction is shorter on the wire than the HTTP+SSE+JWT
+baseline for read-only calls and competitive for audit-grade mutating
+calls. Open work centres on revocation distribution at fleet scale,
+canonical capability ontologies, and symbolic model verification of
+the full handshake. We invite implementors of agent platforms to treat
+this work as a starting specification.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}

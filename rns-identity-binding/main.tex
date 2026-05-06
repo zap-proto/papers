@@ -1,0 +1,401 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{microtype}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!50!black,
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\newcommand{\name}{\mathsf{name}}
+\newcommand{\rec}{\mathsf{rec}}
+\newcommand{\KEM}{\mathsf{KEM}}
+\newcommand{\Sig}{\mathsf{Sig}}
+\newcommand{\Adv}{\mathsf{Adv}}
+\newcommand{\negl}{\mathsf{negl}}
+\newcommand{\KGen}{\mathsf{KGen}}
+\newcommand{\Encap}{\mathsf{Encap}}
+\newcommand{\Decap}{\mathsf{Decap}}
+\newcommand{\Sign}{\mathsf{Sign}}
+\newcommand{\Verify}{\mathsf{Verify}}
+\newcommand{\pk}{\mathit{pk}}
+\newcommand{\sk}{\mathit{sk}}
+\newcommand{\RNS}{\textsc{ZAP-RNS}}
+
+\title{\RNS: Cryptographic Name--Identity Binding for In-Cluster Service Discovery}
+\author{ZAP Protocol Authors\\\texttt{zap-proto.io}}
+\date{2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \RNS, a service-naming scheme in which every name is bound at
+registration time to a long-term key encapsulation mechanism (KEM) public
+key. Claims about a name --- its existence, its current public key, its
+metadata --- are signed under the corresponding private key, and lookups
+return a verifiable chain rooted at a per-cluster authority public key.
+This eliminates name spoofing and Sybil attacks at the protocol layer:
+spoofing the name $N$ reduces to recovering the KEM private key for $N$
+or forging a signature under it. We compare \RNS{} against DNS, DNSSEC,
+mDNS, and SPIFFE/SPIRE; give a formal model in which the
+name-spoofing advantage is bounded by KEM key-recovery and signature
+forgery probabilities; and discuss the operational properties of
+caching, revocation, and federation. \RNS{} is post-quantum native: its
+binding primitive is a KEM (ML-KEM-768 by default) and its signature
+primitive is composable with ML-DSA-65, so the scheme inherits PQ
+guarantees without retrofit. We argue \RNS{} is the right primitive for
+in-cluster service mesh discovery because identity is checked at every
+lookup rather than only at TLS handshake, and because the trust root is
+small, audit-able, and pluggable into existing workload-attestation
+infrastructure.
+\end{abstract}
+
+\section{Introduction}
+
+Service discovery has accumulated layers of compromise. The Domain Name
+System~\cite{rfc1035} answers ``where is $N$?'' but not ``is the holder
+of $N$ who I think it is?'' DNSSEC~\cite{rfc4033} signs records but
+deploys end-to-end in well under 30\% of the public Internet and almost
+never inside a cluster. Multicast DNS~\cite{rfc6762} and SRV
+records~\cite{rfc2782} push naming further into the local network with
+no identity binding at all: any host on the segment can claim any name.
+
+Cluster-scale systems --- ZooKeeper, etcd, Consul, Kubernetes ---
+collapse name and address into a key/value store guarded by an out-of-band
+authentication tier. Discovery is done by querying the store; the
+identity of the discovered service is not part of the record but
+re-established later via TLS, mTLS, or workload attestation. This is
+the SPIFFE/SPIRE model~\cite{spiffe}: a name (URI SVID) is issued as
+an X.509 certificate by a workload attestor on the assumption that the
+Kubernetes API server, kubelet, and node identity are trusted. The
+identity binding lives in a separate plane from the discovery plane.
+
+The recurring failure across these designs is the same: \emph{the name
+itself does not commit to a key}. To go from name to authenticated
+endpoint, every system relies on at least one out-of-band step ---
+DNSSEC chain, X.509 chain, mesh CA, SPIFFE attestor --- and the
+operational burden of those steps is what causes them to be skipped
+in practice.
+
+We propose \RNS, a scheme in which the name \emph{is} a commitment to a
+public key. Registration produces a record
+$(N, \pk_N^\KEM, \pk_N^\Sig, \mathit{ttl}, \sigma)$ where $\sigma$ is a
+chain of signatures terminating at a single per-cluster RNS-root
+public key. Lookups return the full record. Connections encrypt to
+$\pk_N^\KEM$, so reaching an impostor requires either knowing
+$\sk_N^\KEM$ or compromising the RNS root. The same record is
+verifiable offline by any client that has been provisioned with the
+root once. Identity, naming, and key distribution become a single
+primitive.
+
+The contributions of this paper are:
+\begin{enumerate}[label=(\arabic*),leftmargin=*]
+\item A formal definition of \RNS{} records, registration, and lookup
+(\S\ref{sec:def}).
+\item A security model and reductions showing that name-spoofing
+advantage is bounded by KEM key-recovery, signature forgery, and
+RNS-root compromise (\S\ref{sec:sec}, \S\ref{sec:formal}).
+\item A Sybil-resistance argument tying registration cost to the
+cluster's chosen workload-attestation primitive (\S\ref{sec:sybil}).
+\item A comparison of \RNS{} with DNS, DNSSEC, mDNS, and SPIFFE on
+six axes including post-quantum readiness (\S\ref{sec:cmp}).
+\item Implementation notes on caching, revocation, and multi-authority
+federation (\S\ref{sec:impl}).
+\end{enumerate}
+
+\section{Definition of \RNS}\label{sec:def}
+
+Let $\KEM = (\KEM.\KGen, \KEM.\Encap, \KEM.\Decap)$ be an IND-CCA2 secure
+key encapsulation mechanism and let $\Sig = (\Sig.\KGen, \Sig.\Sign,
+\Sig.\Verify)$ be an EUF-CMA secure signature scheme. Default choices
+are ML-KEM-768~\cite{mlkem} and ML-DSA-65~\cite{mldsa}, but the scheme
+is parametric in the primitives.
+
+\begin{definition}[Record]\label{def:record}
+A \RNS{} record is a tuple
+\[
+\rec = \bigl(N,\ \pk^\KEM,\ \pk^\Sig,\ t_0,\ \mathit{ttl},\ m,\ \sigma_{\mathrm{owner}},\ \sigma_{\mathrm{auth}}\bigr)
+\]
+where $N \in \{0,1\}^*$ is the human-readable name, $\pk^\KEM$ and
+$\pk^\Sig$ are the long-term KEM and signing public keys, $t_0$ is
+issuance time, $\mathit{ttl}$ is validity duration, $m$ is auxiliary
+metadata (endpoint, attestation evidence), $\sigma_{\mathrm{owner}} =
+\Sig.\Sign(\sk^\Sig, H(N \| \pk^\KEM \| \pk^\Sig \| t_0 \| \mathit{ttl}
+\| m))$ is the self-signed binding, and $\sigma_{\mathrm{auth}} =
+\Sig.\Sign(\sk_{\mathrm{root}}, H(\rec \setminus \sigma_{\mathrm{auth}}))$
+is the authority counter-signature.
+\end{definition}
+
+\paragraph{Trust root.} A cluster operator generates a single
+$(\pk_{\mathrm{root}}, \sk_{\mathrm{root}})$ pair. $\pk_{\mathrm{root}}$
+is bundled into every workload's image or sidecar at provisioning time.
+$\sk_{\mathrm{root}}$ lives in an HSM or threshold service. There is
+exactly one root per trust domain, and it is the single point of
+human-audit-able trust.
+
+\paragraph{Registration.} A workload runs the protocol of
+Algorithm~\ref{alg:register}. It generates KEM and signing keypairs,
+constructs an unsigned record, signs it under $\sk^\Sig$, and submits
+the record together with attestation evidence (e.g., a Kubernetes
+ServiceAccount token, a TPM quote, a TEE attestation) to the RNS
+authority. The authority validates evidence under its policy, checks
+that $N$ is not already registered (or that the requester is authorised
+to roll the key), and emits $\sigma_{\mathrm{auth}}$.
+
+\begin{algorithm}
+\caption{Registration}\label{alg:register}
+\begin{algorithmic}[1]
+\State $(\pk^\KEM, \sk^\KEM) \gets \KEM.\KGen()$
+\State $(\pk^\Sig, \sk^\Sig) \gets \Sig.\KGen()$
+\State $r \gets (N, \pk^\KEM, \pk^\Sig, t_0, \mathit{ttl}, m)$
+\State $\sigma_{\mathrm{owner}} \gets \Sig.\Sign(\sk^\Sig, H(r))$
+\State submit $(r, \sigma_{\mathrm{owner}}, \mathit{evidence})$ to RNS authority
+\State authority verifies evidence and $\Sig.\Verify(\pk^\Sig, H(r), \sigma_{\mathrm{owner}})$
+\State authority emits $\sigma_{\mathrm{auth}}$ and stores
+$\rec = (r, \sigma_{\mathrm{owner}}, \sigma_{\mathrm{auth}})$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Lookup.} A client queries the RNS authority for $N$ and
+receives $\rec$. Verification:
+\begin{enumerate}[leftmargin=*]
+\item Check $t_0 \le \mathrm{now} \le t_0 + \mathit{ttl}$.
+\item Check $\Sig.\Verify(\pk^\Sig, H(r), \sigma_{\mathrm{owner}})$.
+\item Check $\Sig.\Verify(\pk_{\mathrm{root}}, H(r \| \sigma_{\mathrm{owner}}), \sigma_{\mathrm{auth}})$.
+\item Consult the freshness oracle (revocation list or short-lived
+witness) for $\rec$.
+\end{enumerate}
+On success the client treats $\pk^\KEM$ as the only legitimate
+encapsulation target for $N$.
+
+\paragraph{Connection.} The client encapsulates a fresh shared secret
+under $\pk^\KEM$ and sends the ciphertext together with its first
+record. Only the holder of $\sk^\KEM$ for $N$ can decapsulate.
+Subsequent application traffic uses the derived secret in an AEAD.
+Identity is checked \emph{on every lookup}, not only at handshake.
+
+\paragraph{Encrypted lookup.} The lookup itself can be encapsulated
+to $\pk_{\mathrm{root}}$ (or a sub-key derived from it via HPKE), so
+that passive observers see only an encrypted blob between client and
+RNS. This degrades worst-case adversary capability from ``learns who
+talks to whom'' to ``learns who talks to RNS''.
+
+\section{Security Properties}\label{sec:sec}
+
+\paragraph{Authenticity.} A name not registered in RNS cannot be
+served. A client receiving a record for $N$ verifies a signature chain
+to $\pk_{\mathrm{root}}$; absent the root key, no adversary can
+fabricate a record that verifies.
+
+\paragraph{Continuity.} Once $N$ is bound to $\pk_N^\KEM$, the binding
+changes only via a fresh authority counter-signature. The authority
+policy decides whether re-binding requires (a) a signature from the
+old $\sk^\Sig$ (Lamport-style continuity~\cite{lamport}), (b) re-running
+the original attestation, or (c) explicit operator approval. \RNS{}
+encodes the policy choice in $m$ and refuses lookups whose continuity
+chain breaks the policy.
+
+\paragraph{Privacy.} With encrypted lookup, a network observer learns
+neither the names a client resolves nor the public keys returned. The
+authority still observes both, mitigated by classic
+PIR~\cite{chor1995pir} or OHTTP-style~\cite{ohttp} interposition. We
+treat scalable privacy-preserving lookup as an open problem
+(\S\ref{sec:open}).
+
+\paragraph{Freshness and revocation.} TTLs are short (default
+$300\,\mathrm{s}$). Each authority publishes a signed Merkle witness
+of currently-valid records every TTL/2; clients consult it at each
+lookup. Compromised KEM keys are revoked by appending a tombstone
+record signed by the authority.
+
+\section{Formal Model}\label{sec:formal}
+
+We define the name-spoofing experiment $\mathbf{Exp}^{\mathrm{spoof}}_{\RNS}(\mathcal{A})$:
+
+\begin{enumerate}[leftmargin=*,label=\arabic*.]
+\item Challenger generates $(\pk_{\mathrm{root}}, \sk_{\mathrm{root}})$
+and gives $\pk_{\mathrm{root}}$ to $\mathcal{A}$.
+\item $\mathcal{A}$ may query a registration oracle on names of its
+choice; the oracle runs Algorithm~\ref{alg:register} honestly and
+returns the resulting records and the public keys, but \emph{not} the
+private keys.
+\item $\mathcal{A}$ outputs a target name $N^*$ (not previously
+registered by $\mathcal{A}$ as the legitimate owner) and a forged
+record $\rec^*$.
+\item $\mathcal{A}$ wins if $\rec^*$ verifies against $\pk_{\mathrm{root}}$
+and $\rec^*$'s public key differs from the public key on file at the
+challenger for $N^*$ (or no record exists for $N^*$).
+\end{enumerate}
+
+Theorems~1--3 of the companion proof file bound
+\[
+\Adv^{\mathrm{spoof}}_{\RNS}(\mathcal{A}) \;\le\;
+\Adv^{\mathrm{EUF\text{-}CMA}}_{\Sig}(\mathcal{B}_1) \;+\;
+\Adv^{\mathrm{key\text{-}rec}}_{\KEM}(\mathcal{B}_2) \;+\;
+\Pr[\text{root compromise}],
+\]
+where the third term is policy-controlled and audit-able.
+
+\paragraph{Connection binding.} Theorem~2 of the proof file shows
+that under IND-CCA2 of $\KEM$, a client encrypting to name $N^*$
+reaches a peer holding $\sk_{N^*}^\KEM$ with overwhelming probability,
+or learns nothing.
+
+\section{Sybil Resistance}\label{sec:sybil}
+
+\RNS{} reduces Sybil resistance to attestation-bypass cost. The
+authority emits $\sigma_{\mathrm{auth}}$ only after attestation evidence
+satisfies its policy. The policy is pluggable:
+\begin{itemize}[leftmargin=*]
+\item \textbf{K8s ServiceAccount.} The cluster's API server is the
+attestor; cost = stealing a ServiceAccount token.
+\item \textbf{TPM quote.} A measured-boot TPM signs a PCR digest;
+cost = compromising a hardware root of trust.
+\item \textbf{TEE attestation.} An SEV-SNP / TDX / SGX quote;
+cost = breaking the TEE.
+\item \textbf{Proof-of-stake.} Each registration burns or stakes a
+token; cost = direct economic.
+\end{itemize}
+
+The Sybil bound is tight: an adversary capable of $n$ legitimate
+registrations under the policy can bind $n$ names. The cluster operator
+chooses the per-registration cost to match the consequences. There is
+no ambient Sybil channel because the only way to insert a record is
+through the attestor.
+
+\section{Comparison}\label{sec:cmp}
+
+Table~\ref{tab:cmp} compares discovery schemes on six properties:
+intrinsic name-to-key binding, lookup-time authentication of records,
+encryption-to-name (a client can encrypt directly to a returned
+identity), post-quantum readiness, deployment effort relative to a bare
+DNS deployment, and resistance to a passive network observer learning
+the names being resolved.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcccccc}
+\toprule
+& \textbf{Name binds key} & \textbf{Auth lookup} & \textbf{Enc-to-name} & \textbf{PQ ready} & \textbf{Op cost} & \textbf{Lookup priv.} \\
+\midrule
+DNS~\cite{rfc1035}      & no    & no    & no    & n/a & low    & no \\
+DNSSEC~\cite{rfc4033}   & no\textsuperscript{*} & yes & no & retro & high & no \\
+mDNS~\cite{rfc6762}     & no    & no    & no    & n/a & low    & no \\
+SRV~\cite{rfc2782}      & no    & no    & no    & n/a & low    & no \\
+SPIFFE~\cite{spiffe}    & X.509 & at TLS only & no & retro & high & no \\
+HIP~\cite{rfc7401}      & yes (HI) & yes & yes & retro & high & partial \\
+Tor onion~\cite{tor}    & yes (v3) & yes & yes & no & high & yes \\
+\textbf{\RNS} (this work) & \textbf{yes} & \textbf{yes (every lookup)} & \textbf{yes} & \textbf{native} & \textbf{med} & \textbf{yes (encrypted)} \\
+\bottomrule
+\end{tabular}
+\caption{Comparison of service discovery schemes. ``Name binds key'':
+the name is a commitment to a public key. ``Auth lookup'': lookups
+return signed records that any client can verify. ``Enc-to-name'':
+clients can encrypt directly to the returned identity without a
+preceding handshake. \textsuperscript{*}DNSSEC binds the \emph{zone}
+to a key, not individual service names to service keys.}
+\label{tab:cmp}
+\end{table}
+
+\RNS{} is the only scheme that ticks every column. The closest
+analogue is the Host Identity Protocol (HIP)~\cite{rfc7401}, which
+also separates a host identity from its locator and binds names to
+public keys. \RNS{} differs in four ways: (i) it is post-quantum native;
+(ii) lookups return a chain to a single auditable root, not arbitrary
+DNS resource records; (iii) registration is gated by pluggable
+attestation rather than the open Internet PKI; (iv) the binding is to
+a KEM key, enabling encryption-to-name without a separate key-exchange
+roundtrip.
+
+\section{Implementation Notes}\label{sec:impl}
+
+\paragraph{Caching.} Records are immutable for their TTL. Clients cache
+verified records and a freshness witness; a cache hit costs one
+signature verification. Negative caching of NXDOMAIN responses, signed
+by the authority, prevents downgrade-to-no-record attacks.
+
+\paragraph{Revocation.} Short TTLs ($60\,\mathrm{s}$ to
+$300\,\mathrm{s}$) replace explicit revocation in the common case. For
+emergency revocation the authority publishes a signed tombstone with
+the same name, which evicts cached records on next freshness check.
+
+\paragraph{Federation.} Multiple authorities co-exist by being placed
+in a forest: each authority $A_i$ has $\pk_{\mathrm{root},i}$, and
+clients hold a known-roots set. Names are namespaced by authority
+($N@A_i$), so collisions are impossible. Cross-authority delegation
+is a counter-signature on a delegation record, identical in shape to
+$\sigma_{\mathrm{auth}}$.
+
+\paragraph{Operational primitives.} The authority is a small stateful
+service: $\sim$10\,kB per record, $O(1)$ verification per lookup, and
+no external dependencies beyond the HSM holding $\sk_{\mathrm{root}}$.
+For a cluster of $10^5$ services the on-disk state is below 1\,GB and
+fits in memory on a single node.
+
+\paragraph{Sidecar integration.} A workload's sidecar exposes a local
+UDS, performs registration on startup, caches its own KEM private key
+in a tmpfs (or HSM), and intercepts outgoing connections to translate
+$N$ into $(\pk_N^\KEM, \mathrm{endpoint})$. No application code change
+is required; legacy clients see a familiar resolver interface.
+
+\section{Open Questions}\label{sec:open}
+
+\paragraph{Lookup privacy at scale.} Encrypting the lookup to the
+authority hides names from network observers, but the authority itself
+still sees them. For large public clusters one wants a private
+information retrieval~\cite{chor1995pir} or oblivious-HTTP~\cite{ohttp}
+overlay. Both are quadratic-or-worse in the worst case. We have not
+benchmarked PIR-over-RNS in this paper.
+
+\paragraph{Revocation latency.} Short TTLs reduce revocation latency
+but inflate authority load. We conjecture an adaptive TTL keyed to a
+service's request rate is workable, but have not analysed the
+adversarial-load model.
+
+\paragraph{Multi-region authority placement.} Federated authorities
+trade global consistency for partition tolerance. CRDT-based
+authority sets are an active area; we leave them future work.
+
+\paragraph{Hybrid signatures.} ML-DSA-65 is a sound default, but a
+hybrid (ML-DSA + Ed25519) registration signature would tolerate a
+catastrophic break in either scheme. The cost is roughly doubled
+record size; we treat this as a configuration parameter.
+
+\section{Conclusion}
+
+\RNS{} makes the name into a key. The reduction is sharp: spoofing
+$N$ requires breaking a KEM, forging a signature, or compromising a
+single audit-able root. The scheme is post-quantum native, integrates
+with any workload-attestation primitive a cluster already runs, and
+adds at most one signature verification per lookup beyond a
+DNS-style cache. For in-cluster service mesh discovery --- where the
+trust domain is small, attestation is already required, and identity
+must be checked at every hop --- \RNS{} is a strict improvement on the
+status quo of layered DNS, X.509, and SPIFFE.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}

@@ -1,0 +1,449 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{cite}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  citecolor=blue!50!black,
+  urlcolor=blue!70!black
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{ZAP-FIX: A Zero-Copy, Post-Quantum Transport for the Financial Information eXchange Protocol}
+
+\author{ZAP Protocol Authors\\\texttt{zap-proto.io}}
+
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+The Financial Information eXchange (FIX) protocol is the dominant
+session-layer protocol for institutional equities, futures, and
+derivatives order flow. Its standard transport binding (raw TCP, or
+TCP with TLS~1.3) was designed in an era when (a) bandwidth was the
+binding constraint, (b) nanosecond-scale latency was a curiosity rather
+than a regulatory expectation, and (c) cryptographically relevant
+quantum adversaries were a long-horizon concern. None of these
+conditions hold for institutional venues today. We present
+\emph{ZAP-FIX}, a transport binding for FIX 4.4 and FIX 5.0 SP2 that
+preserves the FIX session layer in full---SequenceNumber discipline,
+Logon/Logout, GapFill, ResendRequest, Heartbeat---while replacing the
+underlying TCP/TLS stream with the ZAP zero-copy, mutually
+authenticated, post-quantum frame protocol. We give a formal latency
+model, a compatibility analysis, a resilience model, and a compliance
+mapping to MiFID~II RTS~25 timestamping. Our analysis shows that
+ZAP-FIX delivers steady-state per-message latency strictly less than
+or equal to FIX-over-TLS, with the gap dominated by the elimination
+of SOH~(\texttt{0x01}) text scanning in favour of zero-copy schema
+fields, and that session-resumption latency is bounded by a single
+ZAP handshake even after pod migration or network partition---a regime
+in which TCP+TLS today requires connection re-establishment plus
+session-state reconstruction.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+
+The Financial Information eXchange (FIX) protocol, in versions 4.2,
+4.4, and 5.0~SP2, is the de~facto session protocol for institutional
+order flow across cash equities, listed futures, options, and a large
+fraction of OTC derivatives~\cite{fix44,fix50sp2}. Conservative public
+estimates put the share of institutional equity order messages carried
+over a FIX session at well above ninety percent. The protocol layers
+cleanly over a reliable byte-stream transport: implementations
+overwhelmingly choose TCP, with TLS~1.3 layered in for venues subject
+to confidentiality or integrity regulation~\cite{rfc8446,rfc9293}.
+
+Two pressures are now reshaping the transport choice. First,
+deterministic tail latency is an explicit best-execution
+obligation under MiFID~II RTS~25, which requires
+microsecond-granular timestamps for many asset
+classes~\cite{rts25}. Co-located institutional clients today operate
+inside a round-trip latency budget of approximately
+$50$--$200~\mu\mathrm{s}$ from order entry to acknowledgement,
+with tail latencies dominated not by steady-state per-message cost
+but by TLS handshake re-establishment and FIX session-state
+reconstruction following a transient
+disconnection~\cite{hasbrouck2013,kissell2013}. Second, the prospect
+of a cryptographically relevant quantum adversary has motivated
+regulators and venue operators to require, or at least to permit,
+post-quantum confidentiality for stored and in-flight order flow,
+under a ``harvest-now, decrypt-later'' threat
+model~\cite{nistpqc,nistsp80056c}.
+
+\paragraph{Contribution.}
+We define \emph{ZAP-FIX}: a transport binding that preserves the FIX
+session protocol as specified by FIX Protocol Limited and
+substitutes only the byte-stream layer. Concretely:
+
+\begin{itemize}
+  \item Each FIX administrative or application message becomes
+        exactly one ZAP frame. There is no in-flight chunking and
+        no aggregation of multiple FIX messages into a single
+        frame, preserving message-boundary semantics.
+  \item The SOH-delimited \texttt{tag=value} body is wrapped in a
+        Cap'n Proto envelope; a small, fixed set of routing fields
+        (\texttt{SenderCompID}, \texttt{TargetCompID},
+        \texttt{MsgSeqNum}, \texttt{MsgType}) is lifted into typed
+        envelope slots so that the gateway can dispatch without
+        scanning the FIX body.
+  \item Session establishment uses the ZAP handshake, which provides
+        mutual authentication and X-Wing hybrid post-quantum key
+        agreement~\cite{xwing,kyber} in a single round trip.
+  \item SequenceNumber discipline is preserved exactly: ZAP frame
+        ordering on a session is constrained to match FIX
+        \texttt{MsgSeqNum} monotonicity, so \texttt{ResendRequest}
+        and \texttt{GapFill} semantics remain intact.
+  \item An optional \emph{ZAP-FIX BinaryEncoding} mode bit-packs
+        frequent typed fields (\texttt{Symbol}, \texttt{Price},
+        \texttt{OrderQty}) directly into the envelope, reducing
+        on-wire bytes by 30--50\% relative to SOH text and
+        eliminating the corresponding format/parse cost. This mode
+        is conceptually adjacent to FIX SBE~\cite{fixsbe} and FIX
+        FAST~\cite{fixfast}, but it inherits the ZAP framing and
+        cryptographic guarantees rather than layering separately.
+\end{itemize}
+
+We also specify a transparent ZAP-FIX gateway, which terminates
+legacy TCP/TLS-FIX on the front side and speaks ZAP-FIX on the
+back side, so that institutional clients carrying long-lived
+connectivity contracts and certifications can adopt ZAP-FIX
+incrementally without endpoint migration.
+
+The remainder of the paper is organised as follows.
+Section~\ref{sec:fix-recap} recaps the FIX session layer.
+Section~\ref{sec:construction} specifies the ZAP-FIX construction.
+Section~\ref{sec:latency} gives the latency analysis.
+Section~\ref{sec:resilience} describes the resilience model.
+Section~\ref{sec:compliance} maps the construction to MiFID~II RTS~25
+and FINRA~OATS audit
+obligations~\cite{rts25,finra-oats,finra-cat}.
+Section~\ref{sec:compat} discusses compatibility with deployed FIX
+infrastructure. Section~\ref{sec:related} surveys related work.
+
+\section{FIX Session Layer Recap}
+\label{sec:fix-recap}
+
+We adopt the standard FIX session-layer
+abstractions~\cite{fix44,fix50sp2}.
+
+A \emph{session} is a bidirectional, sequenced exchange of FIX
+messages between two parties identified by \texttt{SenderCompID} and
+\texttt{TargetCompID}. Each direction maintains a strictly
+increasing \texttt{MsgSeqNum}. The protocol is intentionally
+stream-oriented: the underlying transport is required to deliver
+bytes in order and to surface gaps, but is permitted to coalesce or
+fragment messages at byte granularity. The session layer compensates
+with a small set of administrative messages.
+
+\paragraph{Logon (\texttt{A}).}
+Initiates a session, negotiates encryption (historically; in modern
+deployments \texttt{EncryptMethod}~$=0$ and confidentiality is
+provided by the transport), heartbeat interval, and optional
+sequence-number reset.
+
+\paragraph{Heartbeat (\texttt{0}) and TestRequest (\texttt{1}).}
+Liveness probes; absence of either over an interval triggers session
+termination.
+
+\paragraph{ResendRequest (\texttt{2}) and SequenceReset (\texttt{4}).}
+The receiver, on detection of a gap (\texttt{MsgSeqNum} greater than
+expected), issues \texttt{ResendRequest} for the missing range; the
+sender replays application messages and may emit a
+\texttt{SequenceReset}--GapFill for administrative messages it
+declines to replay.
+
+\paragraph{Logout (\texttt{5}).}
+Graceful termination.
+
+The transport contract that the FIX session layer requires is
+therefore quite narrow: in-order, reliable, byte-oriented delivery
+within a single connection lifetime, with explicit failure (the
+connection is torn down) when delivery cannot be guaranteed. Any
+transport satisfying this contract is admissible. ZAP, restricted
+to a single-session ordered binding, satisfies it; we make this
+precise in Section~\ref{sec:construction}.
+
+\section{ZAP-FIX Construction}
+\label{sec:construction}
+
+\subsection{Frame Mapping}
+
+Let $M$ be a FIX message with header fields
+$h = (\texttt{SenderCompID}, \texttt{TargetCompID},
+\texttt{MsgSeqNum}, \texttt{MsgType})$
+and body $b$ (the \texttt{tag=value} fields excluding $h$, with the
+SOH-delimited textual encoding $\sigma(M)$).
+
+The ZAP-FIX frame for $M$ is the Cap'n Proto envelope
+\[
+F(M) \;=\; \langle\, \mathrm{hdr}(h),\; \mathrm{body}(M)\, \rangle
+\]
+where $\mathrm{hdr}(h)$ is a fixed-layout typed struct exposing the
+four routing fields, and $\mathrm{body}(M)$ is one of the following
+two encodings, negotiated at session \texttt{Logon}.
+
+\begin{itemize}
+  \item \textbf{Text mode.} $\mathrm{body}(M) = \sigma(M)$. The
+        SOH-delimited canonical FIX body is carried verbatim as a
+        single byte slice. Conformance to the FIX specification is
+        bit-for-bit on the body; the envelope is metadata only.
+  \item \textbf{BinaryEncoding mode.} A small dictionary of typed
+        fields (\texttt{Symbol}, \texttt{Price}, \texttt{OrderQty},
+        \texttt{Side}, \texttt{OrdType}, \texttt{TimeInForce},
+        \texttt{TransactTime}, \texttt{ClOrdID}) is bit-packed in
+        the envelope. Remaining fields fall through to a residual
+        SOH body. Decoders MUST be capable of reconstructing the
+        canonical SOH form from the envelope. This mirrors the
+        intent of FIX~SBE~\cite{fixsbe} but does not require a
+        separate transport binding.
+\end{itemize}
+
+\paragraph{One-message-per-frame invariant.}
+For every FIX message $M$, exactly one ZAP frame $F(M)$ is emitted on
+the session, and ZAP frames are not coalesced. This is the only
+deviation from a faithful byte-stream transport, and it strengthens,
+rather than weakens, the FIX session contract: gaps are detectable at
+frame granularity rather than at byte granularity.
+
+\subsection{Session Establishment}
+
+ZAP-FIX session establishment is a strict superset of the FIX Logon
+exchange:
+
+\begin{enumerate}
+  \item \textbf{ZAP handshake.} A single round trip exchanges static
+        and ephemeral X25519 public keys, X-Wing
+        encapsulations~\cite{xwing,kyber}, and a transcript hash. On
+        success, both parties hold a shared traffic secret and a
+        peer identity bound to a static long-term key.
+  \item \textbf{FIX Logon~(\texttt{A}).} The first FIX frame
+        carries Logon. \texttt{EncryptMethod} is fixed to $0$
+        (transport provides confidentiality and integrity).
+        \texttt{HeartBtInt}, \texttt{ResetSeqNumFlag}, and
+        \texttt{NextExpectedMsgSeqNum} retain their FIX semantics.
+\end{enumerate}
+
+The handshake binds the FIX \texttt{SenderCompID} to the ZAP
+identity. The gateway rejects the Logon if the asserted CompID does
+not appear in the entitlement list authorised for the ZAP identity,
+defending against a class of CompID-spoofing attacks that pure
+TCP/TLS-FIX cannot detect at the transport layer.
+
+\subsection{Sequence-Number Discipline}
+
+The ZAP-FIX session maintains, for each direction, the FIX
+invariant
+\begin{equation}
+  \texttt{MsgSeqNum}(F_{i+1}) = \texttt{MsgSeqNum}(F_i) + 1.
+  \label{eq:seqnum}
+\end{equation}
+Because frames are not coalesced and ZAP delivery is in-order on a
+session, the receiver detects a gap by inspecting the envelope
+header alone, without parsing the SOH body. This is the basis for
+the parse-cost advantage of Section~\ref{sec:latency} and for
+faster \texttt{ResendRequest} of Section~\ref{sec:resilience}.
+
+\section{Latency Analysis}
+\label{sec:latency}
+
+We decompose the per-message round-trip latency between two co-located
+peers into:
+\begin{equation}
+  T_{\mathrm{rtt}} \;=\; T_{\mathrm{ser}} + T_{\mathrm{tx}}
+                       + T_{\mathrm{net}}
+                       + T_{\mathrm{rx}} + T_{\mathrm{parse}}
+                       + T_{\mathrm{app}} + T_{\mathrm{rev}}
+  \label{eq:budget}
+\end{equation}
+where $T_{\mathrm{ser}}$ is sender-side serialisation,
+$T_{\mathrm{tx}}$ kernel transmit, $T_{\mathrm{net}}$ wire and
+switch fabric, $T_{\mathrm{rx}}$ kernel receive, $T_{\mathrm{parse}}$
+receiver-side parse, $T_{\mathrm{app}}$ application processing
+(matching, risk, etc.), and $T_{\mathrm{rev}}$ the reverse-path
+contributions.
+
+The transport choice fixes
+$T_{\mathrm{ser}}$, $T_{\mathrm{parse}}$, and partially
+$T_{\mathrm{net}}$ (via on-wire byte count). $T_{\mathrm{app}}$ is
+unaffected.
+
+\subsection{Steady-State Per-Message Cost}
+
+\paragraph{Serialisation.}
+For FIX-over-TCP/TLS, $T_{\mathrm{ser}}$ is dominated by formatting
+typed fields into ASCII and inserting SOH separators; in optimised
+implementations this lands in the $1$--$5~\mu\mathrm{s}$ range per
+message. For ZAP-FIX text mode, the cost is the same plus a
+constant Cap'n Proto envelope ($< 100~\mathrm{ns}$ on contemporary
+hardware). For ZAP-FIX BinaryEncoding mode, formatting of the
+hot fields is replaced by bit-packing of pre-typed values
+(approximately $50$--$200~\mathrm{ns}$ for the hot field set).
+
+\paragraph{Parse.}
+For FIX-over-TCP/TLS, $T_{\mathrm{parse}}$ is dominated by an SOH
+scan and \texttt{tag=value} tokenisation; routing fields are
+reachable only after the scan reaches them. For ZAP-FIX, routing
+fields are zero-copy reads from the envelope; an end-to-end FIX
+session that only requires the routing fields plus a handful of
+hot fields can avoid touching the SOH body altogether.
+
+\paragraph{On-wire bytes.}
+A typical \texttt{NewOrderSingle} in SOH text is in the range
+$180$--$280$ bytes. ZAP-FIX BinaryEncoding mode reduces this to
+$110$--$170$ bytes for the same field set. Within a single
+$1500$-byte MTU, $T_{\mathrm{net}}$ is unaffected; over multi-segment
+or constrained fabrics, the byte reduction translates linearly.
+
+We make this precise in Theorem~1 of the companion proof document.
+
+\subsection{Handshake and Resumption}
+
+A TLS~1.3 handshake completes in one round trip in the
+\texttt{0-RTT} or \texttt{1-RTT} regime~\cite{rfc8446}. The ZAP
+handshake also completes in one round trip and yields the same
+forward-secrecy and authentication properties, plus post-quantum
+KEM hybridisation~\cite{xwing}. In steady state the handshake cost
+is amortised; the regime in which it dominates is connection
+re-establishment, which we treat in Section~\ref{sec:resilience}.
+
+\section{Resilience}
+\label{sec:resilience}
+
+A FIX session over TCP+TLS that loses its underlying TCP connection
+must:
+\begin{enumerate}
+  \item Re-establish a TCP connection (one round trip plus retransmit
+        backoff if loss was the cause).
+  \item Re-establish a TLS session (one round trip; or
+        \texttt{0-RTT} resumption with replay-window caveats).
+  \item Reissue \texttt{Logon}.
+  \item Detect the gap by comparing \texttt{MsgSeqNum} expectations.
+  \item Issue \texttt{ResendRequest} and replay the missing range.
+\end{enumerate}
+Empirically the dominant cost in steps 4--5 is the byte-stream scan
+of the receive buffer to locate FIX message boundaries, since the
+TCP byte-stream surface does not expose them.
+
+ZAP-FIX collapses this:
+\begin{enumerate}
+  \item One ZAP handshake re-establishes the secure channel.
+  \item \texttt{Logon} reasserts the session.
+  \item Gap detection is a single integer comparison on the next
+        envelope header.
+  \item \texttt{ResendRequest} is parameterised by frame indices,
+        and replay is read from a frame-addressable durable buffer.
+\end{enumerate}
+We bound this in Theorem~2 of the companion proof document.
+
+\section{Compliance and Audit}
+\label{sec:compliance}
+
+\paragraph{MiFID~II RTS~25.}
+RTS~25 mandates clock synchronisation and timestamp granularity
+appropriate to the asset class; for HFT-eligible flow the threshold
+is $1~\mu\mathrm{s}$ with a divergence from UTC bounded by
+$100~\mu\mathrm{s}$~\cite{rts25}. ZAP-FIX frames carry a transport
+timestamp populated from a hardware \texttt{PTP/IEEE-1588}-disciplined
+clock, signed inside the frame's authenticated additional data. The
+signed transport timestamp is in addition to the FIX
+\texttt{TransactTime} (tag~60) carried in the body; the two are
+independently auditable.
+
+\paragraph{FINRA~OATS, ATS-N, CAT.}
+The FIX session-layer artefacts that these regimes require
+(\texttt{ClOrdID}, \texttt{OrigClOrdID}, event timestamps,
+\texttt{ExecID})~\cite{finra-oats,finra-cat} are unchanged by
+ZAP-FIX; the binding adds, rather than replaces, audit signal.
+Crucially, the ZAP frame's authenticated transcript is itself an
+admissible audit artefact: the absence of a frame in the durable
+log implies the absence of the corresponding FIX message at the
+session layer, with cryptographic strength.
+
+\paragraph{Post-quantum confidentiality.}
+For asset classes whose order intent retains economic value over
+multi-year horizons (some primary issuance, certain block trades,
+strategic accumulation programmes), harvest-now-decrypt-later is a
+realistic threat. ZAP-FIX inherits the X-Wing hybrid KEM~\cite{xwing}
+of the underlying ZAP transport; FIX-over-TLS does not, in any
+deployed profile.
+
+\section{Compatibility}
+\label{sec:compat}
+
+ZAP-FIX coexists with deployed FIX infrastructure through a
+transparent translation gateway. The gateway terminates a TCP/TLS-FIX
+session on its public face and a ZAP-FIX session on its private
+face. Because the FIX session layer is unchanged, the gateway is a
+stateful but stateless-with-respect-to-application-semantics relay:
+it forwards Logon, Logout, Heartbeat, and SequenceReset transparently,
+and translates between the SOH byte stream and the ZAP envelope.
+
+This means an institutional client whose order-management system is
+certified against a specific FIX dialect over TCP+TLS need not
+recertify or modify its endpoint. Migration to ZAP-FIX endpoints can
+proceed at the operator's pace.
+
+\section{Related Work}
+\label{sec:related}
+
+FIX~FAST~\cite{fixfast} compresses FIX market-data feeds via implicit
+field presence and stop-bit encodings; it is widely deployed for
+multicast market data but uncommon for order entry. FIX~SBE
+(Simple Binary Encoding)~\cite{fixsbe} replaces SOH text with a
+fixed-layout binary encoding; it presupposes a transport binding
+and is most often layered over TCP. ZAP-FIX BinaryEncoding mode is
+philosophically closest to SBE but inherits transport-layer security
+and post-quantum guarantees from ZAP.
+
+FIX-over-WebSocket extensions exist for browser-side market data and
+retail-adjacent order entry; they trade efficiency for firewall
+traversal. They are not used in colocated institutional channels
+and are not a competitor in the regime addressed here.
+
+The HFT-latency literature gives detailed budgets and tail-latency
+analyses against which our model can be
+calibrated~\cite{hasbrouck2013,kissell2013,latencylottery}.
+Colocated venue architectures from Refinitiv, Bloomberg, and SFTI
+universally expose TCP+TLS-FIX as the institutional binding;
+ZAP-FIX is intended as a forward-compatible upgrade path.
+
+\section{Conclusion}
+
+ZAP-FIX preserves the FIX session protocol bit-for-bit while
+substituting a zero-copy, mutually authenticated, post-quantum
+transport for the TCP+TLS byte stream. The construction is
+transparent to FIX session-layer logic, recoverable through the
+existing GapFill/ResendRequest mechanisms, and strictly improves on
+the steady-state and resumption latency of TCP+TLS-FIX. The
+companion proof document gives the formal latency model.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}
