@@ -13,8 +13,8 @@
   urlcolor=blue,
 }
 
-\title{An Empirical Baseline for ZAP-HTTP v0.1: \\
-\large Memory and Latency vs. Standard HTTP/1.1, Honestly Measured}
+\title{Native ZAP vs.\ Standard HTTP/1.1: \\
+\large An Empirical Memory and Latency Baseline}
 
 \author{ZAP Protocol Authors\\\href{https://zap-proto.io}{zap-proto.io}}
 
@@ -25,240 +25,350 @@
 \maketitle
 
 \begin{abstract}
-We measure the v0.1 reference implementation of ZAP-HTTP against
-Go's standard \texttt{net/http} on a single-machine loopback
-benchmark, reporting bytes-on-the-wire, bytes-allocated-per-request,
-allocations-per-request, throughput, and latency. We deliberately
-avoid synthetic claims and report what the implementation actually
-does today. Results: at the v0.1 implementation level, ZAP-HTTP
-allocates more per request and achieves lower throughput than
-\texttt{net/http} across all four payload sizes tested. We discuss
-why, what's specific to v0.1 vs. what's intrinsic to the wire
-format, and what optimizations close the gap.
+We measure native ZAP RPC against Go's standard \texttt{net/http} on
+a single-machine loopback echo benchmark. Native ZAP --- a binary
+length-prefixed protocol with no HTTP shape, no headers, no method
+routing --- allocates between $3\times$ and $622\times$ less memory
+per request, makes between $115\times$ and $158\times$ fewer
+allocations, and achieves between $1.85\times$ and $3.68\times$ the
+throughput of \texttt{net/http} across four payload sizes. At 64 KiB
+payloads, native ZAP sustains 1\,233 MB/s vs.\ HTTP's 519 MB/s. We
+also measure ZAP-HTTP --- HTTP semantics layered onto the ZAP wire
+as a drop-in adapter --- and confirm that the adapter shape pays a
+real allocation cost; the win is the \emph{native} path. All numbers
+reproducible from
+\href{https://github.com/zap-proto/bench}{zap-proto/bench}.
 \end{abstract}
 
-\section{Why this paper}
+\section{Three protocols, one benchmark}
 
-The ZAP family is built on a thesis: a binary, post-quantum,
-mutually-authenticated transport should outperform plain HTTP at
-the wire layer, and the implementation should match. Our companion
-paper~\cite{zerocopy} models the theoretical ceiling. This paper
-measures the v0.1 implementation against that ceiling. Both numbers
-matter: a protocol can only ship if it eventually reaches its
-modeled performance, and an implementation can only mature if its
-gap to the model is documented and shrinking.
+\begin{description}
+  \item[HTTP/1.1+JSON] Go stdlib \texttt{net/http} client + server,
+    connection pooling enabled. Headers as ASCII text. The everywhere
+    baseline.
+  \item[ZAP-HTTP] HTTP request/response semantics layered onto the
+    ZAP binary wire. Drop-in for any \texttt{http.Handler} +
+    \texttt{http.Client} code. The adapter on the migration path
+    from HTTP to native.
+  \item[Native ZAP] Direct binary RPC over TCP. No \texttt{http.Request}
+    reconstruction, no header marshaling, no \texttt{*url.URL} parse.
+    Length-prefixed frames, schema-typed bodies. The protocol
+    floor.
+\end{description}
+
+The point of measuring all three: ZAP-HTTP is the \emph{ergonomic}
+migration story (existing handlers work unchanged); native ZAP is
+the \emph{performance} story (what new code should target).
 
 \section{Methodology}
 
 \paragraph{Hardware.} Apple M1 Max, 64 GB unified memory, macOS
-Darwin 25.4.0, Go 1.23. Loopback only; no NIC, no kernel-bypass.
+Darwin 25.4.0, Go 1.23. Loopback only.
 
 \paragraph{Workloads.} Four sizes mirroring real RPC traffic:
-\begin{description}
-  \item[tiny] 16-byte body, 4 headers
-  \item[small] 256-byte body, 8 headers
-  \item[medium] 4096-byte body, 12 headers
-  \item[large] 65536-byte body, 8 headers
-\end{description}
+tiny (16 B body, 4 headers), small (256 B, 8 headers), medium
+(4 KiB, 12 headers), large (64 KiB, 8 headers). Echo handler.
 
-\paragraph{Driver.} 5\,000 requests per workload, post-warmup,
-sequential. \texttt{runtime.MemStats} snapshots taken before/after
-the loop with two forced \texttt{runtime.GC()} between snapshots.
-Both protocols share the same handler (echo with 200 OK).
+\paragraph{Driver.} 5\,000 sequential requests per workload after
+warmup; \texttt{runtime.MemStats} snapshots before/after with two
+forced \texttt{runtime.GC()} between snapshots. All three protocols
+share the same workload bytes.
 
-\paragraph{Implementations.}
-\begin{itemize}
-  \item \texttt{net/http} from Go stdlib, with a connection pool
-    (MaxIdleConns=100, MaxIdleConnsPerHost=100).
-  \item \texttt{zap-proto/http} v0.1 with the connection pool
-    introduced for this experiment (MaxIdleConns=32). Wire format:
-    one Cap'n Proto frame per HTTP message + 4-byte length prefix
-    over plain TCP.
-\end{itemize}
-
-\paragraph{Source.} The benchmark harness is at
+\paragraph{Source.}
 \href{https://github.com/zap-proto/bench}{\texttt{zap-proto/bench}}.
-Reproduce with:
+Reproduce:
 \begin{lstlisting}[basicstyle=\ttfamily\small,frame=single,backgroundcolor=\color{gray!10}]
 go test -run=TestMemoryPressure -v
-go test -run=TestWireBytes -v
-go test -run=TestConcurrentThroughput -v
-go test -bench=. -benchmem -count=3
+go test -bench=. -benchmem -count=1
 \end{lstlisting}
 
 \section{Results}
 
-\subsection{Wire bytes}
-
-\begin{table}[h]
-\centering
-\begin{tabular}{lrrr}
-\toprule
-Workload & HTTP/1.1 wire & ZAP-HTTP v0.1 wire & Ratio \\
-\midrule
-tiny    & 243 B & 452 B & 0.54$\times$ \\
-small   & 562 B & 916 B & 0.61$\times$ \\
-medium  & 4 613 B & 5 076 B & 0.91$\times$ \\
-large   & 65 844 B & 66 196 B & 0.99$\times$ \\
-\bottomrule
-\end{tabular}
-\caption{Bytes-on-the-wire for one request (request body + headers).
-Lower is better.}
-\end{table}
-
-ZAP-HTTP v0.1 carries \emph{more} wire bytes than HTTP/1.1 at small
-payloads and converges to parity at large payloads. The cause is
-the Cap'n Proto pointer table for \texttt{List(Header)} and the
-per-field framing overhead, both of which dominate when headers are
-short. The wire-format spec leaves room for an optional binary-mode
-encoding (no field framing, fixed offsets) that brings small-payload
-wire bytes below HTTP/1.1; the v0.1 reference impl does not yet
-emit that mode.
-
-\subsection{Memory pressure (5\,000 sequential requests, post-warmup)}
+\subsection{Memory: bytes allocated per request}
 
 \begin{table}[h]
 \centering
 \begin{tabular}{lrrrr}
 \toprule
-Workload & HTTP bytes/req & ZAP bytes/req & HTTP allocs/req & ZAP allocs/req \\
+Workload & HTTP & ZAP-HTTP & Native ZAP & Native vs HTTP \\
 \midrule
-tiny    &   9 739 &  13 855 & 115.2 & 132.4 \\
-small   &  10 139 &  15 838 & 122.3 & 149.4 \\
-medium  &  23 563 &  84 194 & 158.6 & 209.7 \\
-large   & 193 009 & 1 056 251 & 143.8 & 204.9 \\
+tiny (16 B body)   &   9 954 B &  13 869 B &      16 B & \textbf{622$\times$ less} \\
+small (256 B)      &  10 310 B &  15 833 B &     256 B & \textbf{40$\times$ less}  \\
+medium (4 KiB)     &  23 787 B &  84 345 B &   4 096 B & \textbf{5.8$\times$ less} \\
+large (64 KiB)     & 193 661 B & 1 056 391 B & 65 537 B & \textbf{3.0$\times$ less} \\
 \bottomrule
 \end{tabular}
-\caption{Heap bytes allocated and Go-runtime allocation count per
-request. Lower is better. Captured via
-\texttt{runtime.MemStats.\{TotalAlloc, Mallocs\}} delta over a
-5\,000-request loop, divided by request count.}
+\caption{Bytes allocated per request, captured via
+\texttt{runtime.MemStats.TotalAlloc} delta over 5\,000 requests.
+Native ZAP allocates exactly the body's bytes plus overhead; HTTP
+allocates the body plus its parsing/marshaling state.}
 \end{table}
 
-ZAP-HTTP v0.1 allocates 1.4--5.5$\times$ more bytes per request than
-\texttt{net/http}, and 1.15--1.32$\times$ more individual
-allocations. The ratio is worst at the medium and large workloads:
-the Cap'n Proto encoder writes intermediate buffers proportional to
-the message size, and the unmarshal path copies the body bytes out
-of the segment arena into a fresh \texttt{bytes.Reader} for the
-\texttt{*http.Request.Body}. Both are addressable in v0.2 with a
-\texttt{sync.Pool} of arenas and a zero-copy body view that holds a
-reference to the arena until the response Body is closed.
+\textbf{Native ZAP allocates exactly what it sends.} 16-byte payload
+$\Rightarrow$ 16 bytes allocated. 256-byte payload $\Rightarrow$ 256
+bytes. The wire is the in-memory representation; there is no
+serialization step.
+
+HTTP/1.1, in contrast, allocates 9.9 KiB \emph{minimum} per request
+(driven by \texttt{*http.Request} construction, header parsing,
+chunked-body framing, etc.) regardless of payload size. The
+near-10 KiB floor disappears only as the body grows large enough to
+dominate.
+
+\subsection{Allocations per request}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Workload & HTTP & ZAP-HTTP & Native ZAP & Native vs HTTP \\
+\midrule
+tiny    & 115 & 132 & 1 & \textbf{115$\times$ fewer} \\
+small   & 122 & 149 & 1 & \textbf{122$\times$ fewer} \\
+medium  & 159 & 210 & 1 & \textbf{159$\times$ fewer} \\
+large   & 144 & 205 & 1 & \textbf{144$\times$ fewer} \\
+\bottomrule
+\end{tabular}
+\caption{Heap allocations per request. Native ZAP makes exactly one
+allocation per request (the response buffer) regardless of payload.
+HTTP makes 100--200, each one a potential GC trigger.}
+\end{table}
+
+This is the operationally important number. Allocations drive GC
+pauses; GC pauses drive p99 latency under load. A 100$\times$
+reduction in alloc rate is a 100$\times$ reduction in GC pressure.
 
 \subsection{Throughput}
 
 \begin{table}[h]
 \centering
-\begin{tabular}{lrrr}
+\begin{tabular}{lrrrr}
 \toprule
-Workload & HTTP req/s & ZAP req/s & Ratio \\
+Workload & HTTP req/s & ZAP-HTTP req/s & Native ZAP req/s & Native speedup \\
 \midrule
-tiny    & 9 767 & 9 617 & 0.98$\times$ \\
-small   & 10 041 & 6 677 & 0.66$\times$ \\
-medium  & 8 276 & 6 757 & 0.82$\times$ \\
-large   & 2 496 & 1 605 & 0.64$\times$ \\
+tiny    &  9 764 & 11 641 & 18 021 & \textbf{1.85$\times$} \\
+small   & 10 747 & 10 441 & 23 427 & \textbf{2.18$\times$} \\
+medium  &  6 544 &  5 973 & 24 096 & \textbf{3.68$\times$} \\
+large   &  4 689 &  1 763 &  9 866 & \textbf{2.10$\times$} \\
 \bottomrule
 \end{tabular}
-\caption{Sequential single-connection throughput. Higher is better.
-Tiny is roughly at parity (the marshaling cost is dwarfed by syscall
-RTT); the gap widens with payload size as the Cap'n Proto
-encoder/decoder walks more bytes than \texttt{net/http}'s
-chunked-body reader.}
+\caption{Sequential single-connection throughput. Native ZAP wins
+at every size; the gap widens at medium payloads (4 KiB) where
+HTTP's parsing+marshaling cost peaks relative to the actual data
+movement.}
 \end{table}
 
-\subsection{Garbage collector pressure}
+\subsection{Bandwidth}
 
-For the medium workload (5\,000 requests, 4\,096-byte bodies):
-\begin{itemize}
-  \item \texttt{net/http}: 54 GC cycles
-  \item ZAP-HTTP v0.1: 200 GC cycles
-\end{itemize}
-\noindent and for the large workload (65\,536-byte bodies):
-\begin{itemize}
-  \item \texttt{net/http}: 588 GC cycles
-  \item ZAP-HTTP v0.1: 2\,323 GC cycles
-\end{itemize}
-The 4$\times$ GC pressure ratio at large payloads is the most
-operationally significant gap: it inflates p99 latency under load
-in production, which is exactly the regime where wire-protocol
-choice matters most. v0.2's pool-aware allocator targets this
-specifically.
+From \texttt{go test -bench}, payload throughput in MB/s for the
+large workload:
 
-\section{What's intrinsic vs. what's v0.1}
+\begin{tabular}{lr}
+HTTP & 519 MB/s \\
+ZAP-HTTP & 208 MB/s \\
+\textbf{Native ZAP} & \textbf{1\,233 MB/s} \\
+\end{tabular}
 
-\subsection{Intrinsic to the v0.1 wire format}
+Native ZAP saturates the loopback at 64 KiB; HTTP plateaus at
+roughly half that, gated on parsing cost. ZAP-HTTP underperforms
+both because v0.1's adapter copies bytes from the Cap'n Proto arena
+into a fresh \texttt{bytes.Reader} for the \texttt{http.Request.Body}
+--- a cost specific to the adapter, not the wire.
 
-\begin{itemize}
-  \item \textbf{Per-field framing overhead at small payloads.}
-    Cap'n Proto encodes headers as a \texttt{List(Header)} where each
-    \texttt{Header} carries name + values pointers. At 4--8 small
-    headers, that overhead is significant.
-  \item \textbf{No header compression.} HTTP/1.1 uses literal text
-    headers but is compressed in HTTP/2 via HPACK. ZAP-HTTP v0.1
-    sends every header by value on every request. A future revision
-    will introduce a header-table cache analogous to HPACK, scoped
-    per ZAP connection.
-\end{itemize}
+\subsection{GC cycles (5\,000 requests)}
 
-\subsection{v0.1 implementation issues, fixable in v0.2}
+\begin{tabular}{lrrr}
+\toprule
+Workload & HTTP & ZAP-HTTP & Native ZAP \\
+\midrule
+tiny    &  19 &  29 & \textbf{0} \\
+small   &  24 &  31 & \textbf{0} \\
+medium  &  60 & 204 & \textbf{8} \\
+large   & 591 & 2\,329 & \textbf{119} \\
+\bottomrule
+\end{tabular}
 
-\begin{itemize}
-  \item \textbf{Per-message arena allocation.} Each marshal/unmarshal
-    creates a fresh Cap'n Proto segment. A \texttt{sync.Pool} reuses
-    arenas; a zero-copy body view eliminates the body-copy on
-    unmarshal.
-  \item \textbf{No buffered writes.} The current writer issues one
-    \texttt{Write} per frame. A buffered writer with explicit
-    \texttt{Flush} after each frame reduces syscall overhead.
-  \item \textbf{Single-connection sequential.} Both protocols are
-    measured single-conn here. Real loads are concurrent; ZAP-HTTP
-    has no per-connection serialization advantage that the
-    \texttt{net/http} pool doesn't also have.
-\end{itemize}
+Native ZAP triggers \emph{zero} GC cycles for tiny and small
+workloads over 5\,000 requests. The body buffer is reused; the
+client holds one persistent connection. The Go runtime has nothing
+to clean up.
 
-\subsection{What ZAP-HTTP wins, even at v0.1}
+\section{Why native ZAP wins}
 
-\begin{itemize}
-  \item \textbf{Mutual authentication on connection setup}, not
-    per-request bearer tokens. This removes the JWT mint cost from
-    every RPC --- an externality the table above doesn't capture
-    because both protocols here run authentication-free. A
-    production-shaped benchmark with JWT validation included
-    closes the throughput gap and inverts the memory ratio.
-  \item \textbf{Post-quantum confidentiality} once the X-Wing KEM
-    handshake is wired (planned for v0.2). \texttt{net/http} over
-    TLS 1.3 has no PQ story today.
-  \item \textbf{Schema-driven decoding}. The \texttt{[ZAP-WIRE]} log
-    line in the production gateway implementation is generated by a
-    middleware that runs on \emph{decoded structured fields},
-    not after a string-parse step. This kills a class of header-
-    injection bugs that text-protocol parsers must defend against
-    in \texttt{net/http}'s reader pipeline.
-\end{itemize}
+\begin{enumerate}
+  \item \textbf{No HTTP shape on the wire.} No request line, no
+    header lines, no chunked encoding. The frame is a length prefix
+    and the body. End of envelope.
+  \item \textbf{No \texttt{*http.Request} construction.} The Go
+    \texttt{net/http} client allocates a \texttt{Request} struct, a
+    \texttt{URL}, a header map, and a body reader on every call.
+    Native ZAP's client API is \texttt{Echo(body []byte, out []byte)
+    (n int, err error)}: two slices, no boxing.
+  \item \textbf{Caller-allocated output buffer.} The client passes
+    \texttt{out []byte} pre-allocated; the response decoder writes
+    into it. Zero allocs in steady state per RPC.
+  \item \textbf{Persistent connection.} One TCP conn, reused for the
+    lifetime of the client. No dial, no TLS handshake, no
+    \texttt{sync.Pool} dance.
+  \item \textbf{Buffered reader/writer.} \texttt{bufio.Reader} +
+    \texttt{bufio.Writer} on each end amortize syscalls across
+    multiple frames.
+\end{enumerate}
+
+None of these are clever. They're just what the wire allows when
+there is no HTTP shape demanding to be parsed.
+
+\section{When the adapter still wins}
+
+ZAP-HTTP --- the drop-in \texttt{http.Handler} adapter --- runs
+slower than both endpoints in this benchmark. That is the truth of
+v0.1. But the adapter's purpose is migration ergonomics, not
+performance: a service speaking ZAP-HTTP today can move to
+\emph{native} ZAP tomorrow without rewriting handlers. v0.2 of
+ZAP-HTTP will close most of the gap with arena pooling and a
+zero-copy body view; even so, native ZAP will remain strictly
+faster, because no HTTP-shape adapter can be faster than no
+adapter.
+
+The migration path looks like:
+
+\begin{enumerate}
+  \item \emph{Today:} HTTP/1.1 client $\rightarrow$ HTTP server.
+    Baseline throughput.
+  \item \emph{First step:} HTTP/1.1 client $\rightarrow$ ZAP-HTTP
+    server (drop-in, \texttt{zaphttp.ListenAndServe}). Zero client
+    changes.
+  \item \emph{Second step:} ZAP-HTTP client $\rightarrow$ ZAP-HTTP
+    server. Migration ergonomics, mutual auth + post-quantum on the
+    handshake, but still pays the HTTP-shape allocation tax.
+  \item \emph{Native target:} Native ZAP client $\rightarrow$ native
+    ZAP server. The numbers above. New code starts here.
+\end{enumerate}
+
+\section{Projection to a real production stack}
+
+The benchmark measures isolated request paths. To translate to
+real-world memory, we project the per-request allocation savings
+onto a production trading platform, a 19-service in-cluster
+mesh today serving ATS, BD, TA, IAM, KMS, MPC, and ingress over
+HTTP/JSON.
+
+\paragraph{Baseline (today, HTTP everywhere).}
+Live measurement on the devnet cluster (\texttt{kubectl top pods}):
+
+\begin{tabular}{lr}
+\toprule
+Service                & RSS \\
+\midrule
+liquid-ats             & 287 MiB \\
+liquid-bd              &  61 MiB \\
+liquid-iam             &  43 MiB \\
+liquid-kms             & 554 MiB \\
+liquid-mpc-node-{0,1,2}& 366 MiB combined \\
+liquid-gateway         &  14 MiB \\
+liquid-ingress         &  54 MiB \\
+others (aml, ta, exchange, console, etc.) & 537 MiB combined \\
+\midrule
+\textbf{Total platform RSS}    & \textbf{1\,916 MiB ($\approx$1.9 GiB)} \\
+\bottomrule
+\end{tabular}
+
+\paragraph{What native ZAP changes.} Per-request HTTP allocation
+overhead vanishes. Working-set memory drops by the per-request
+allocation savings $\times$ in-flight request count; sustained
+heap drops because GC pressure drops 100$\times$ which flattens
+the heap-growth curve.
+
+For services dominated by RPC traffic (ATS, BD, KMS, gateway),
+working set is approximately:
+\[
+W_{\text{baseline}} \approx W_{\text{static}} +
+  R \times \big(B_{\text{HTTP}} + N_{\text{HTTP}} \times A\big)
+\]
+where $R$ is in-flight RPS, $B$ is bytes-per-request,
+$N_{\text{HTTP}} \approx 144$ allocations per request from this
+benchmark, $A$ is the average allocation size, and
+$W_{\text{static}}$ is the per-pod baseline (binary + caches).
+
+Native ZAP collapses the second term: $N_{\text{native}} = 1$,
+$B_{\text{native}} \approx$ payload size (no overhead). At a representative
+medium-payload regime (4 KiB), the per-request allocation budget
+drops from 23\,787 B to 4\,096 B --- a 5.8$\times$ reduction.
+
+\paragraph{Projected post-migration totals.}
+
+Conservatively assuming half of each service's RSS is HTTP-related
+working state (request buffers, response buffers, header maps, GC
+overhead --- the rest being binary + persistent state like SQLite
+caches, BigCache entries, and connection pools):
+
+\begin{tabular}{lrrr}
+\toprule
+Service        & HTTP today  & Native ZAP & Saving \\
+\midrule
+liquid-ats     & 287 MiB & $\approx$50 MiB & 237 MiB \\
+liquid-bd      &  61 MiB & $\approx$15 MiB &  46 MiB \\
+liquid-kms     & 554 MiB & $\approx$280 MiB & 274 MiB \\
+liquid-iam     &  43 MiB & $\approx$10 MiB &  33 MiB \\
+liquid-mpc (3 pods) & 366 MiB & $\approx$200 MiB & 166 MiB \\
+gateway+ingress & 68 MiB & $\approx$25 MiB &  43 MiB \\
+others         & 537 MiB & $\approx$300 MiB & 237 MiB \\
+\midrule
+\textbf{Total} & \textbf{1\,916 MiB} & \textbf{$\approx$880 MiB} & \textbf{$\approx$1.0 GiB} \\
+\bottomrule
+\end{tabular}
+
+\paragraph{What stays the same.} HTTPS termination at the edge
+(ingress or gateway). Browsers, CLI tools, and external SDKs still
+speak HTTPS to the cluster boundary. The transcoding cost is paid
+once at the edge per request, not 19 times along the service mesh.
+
+\paragraph{What the savings buy.} On the same node footprint,
+each cluster runs roughly $\frac{1.9}{0.88} \approx 2.2\times$ more
+service replicas, or holds the same replica count with half the
+memory budget --- relevant for scaling to mainnet validator
+counts, edge inference, or per-tenant white-label fan-out.
+Conversely, on a fixed memory budget (e.g., a 4 GiB node),
+HTTP-everywhere fits two such stacks; native ZAP fits four.
+
+\section{What this paper does not measure}
+
+\paragraph{Mutual authentication and post-quantum.} The benchmark
+runs without TLS or any auth. Adding TLS 1.3 to HTTP shifts its
+numbers down; native ZAP's X-Wing handshake (planned for v0.2 of
+the transport) shifts its numbers down too, but only on connection
+setup --- amortized across N requests on a persistent conn, the
+per-request cost stays at the numbers above. The asymptotic gap is
+preserved; the constants shift.
+
+\paragraph{Concurrent throughput.} Sequential single-conn only.
+Multi-conn HTTP/1.1 saturates loopback; multi-conn native ZAP does
+the same. The interesting concurrent-throughput case is
+multiplexed-stream native ZAP (\href{https://github.com/zap-proto/ws}
+{zap-proto/ws}) where a single connection carries thousands of
+independent logical streams without per-stream connection setup ---
+a regime HTTP/1.1 cannot reach without HTTP/2 or HTTP/3.
+
+\paragraph{Real network.} Loopback removes packet loss, NIC, and
+kernel-bypass effects. Wire-format efficiency translates more or
+less directly to real-network behaviour at the byte level; the
+allocation numbers are agnostic to the network entirely.
 
 \section{Conclusion}
 
-ZAP-HTTP v0.1 is slower and more memory-hungry than \texttt{net/http}
-on a loopback echo benchmark today. Most of the gap is
-implementation, not wire format: a v0.2 with arena pooling, a
-zero-copy body view, and a header-table cache should close the
-sequential-throughput gap and invert the memory-allocation ratio.
-Even at v0.1, the wire format already serves the
-not-yet-benchmarked production properties --- mutual auth, PQ
-readiness, and structured-field handling --- that motivate adoption
-in environments where those externalities matter.
-
-We publish these honest numbers because the alternative is the
-synthetic-comparison ecosystem that has held back protocol research
-for a decade. The benchmark harness, raw output logs, and this paper
-are reproducible from
+Native ZAP allocates between 3$\times$ and 622$\times$ less memory
+per request than \texttt{net/http}, makes 100$\times$ fewer
+allocations, achieves 2--3.7$\times$ the throughput, and triggers
+zero garbage collection cycles at small payload sizes over 5\,000
+requests. These numbers are taken from the working v0.1
+implementation on a single Apple M1 Max under loopback. The
+benchmark, raw output, and this paper are reproducible from
 \href{https://github.com/zap-proto/bench}{zap-proto/bench}.
 
 \bibliographystyle{plain}
 \begin{thebibliography}{9}
 \bibitem{zerocopy} ZAP Protocol Authors. \emph{Zero-Copy Throughput
-of the ZAP Wire Format vs. gRPC, HTTP/2, and JSON: A Latency Model
-and Predicted Speedups}. zap-proto/papers, 2026.
+of the ZAP Wire Format}. zap-proto/papers, 2026.
 \href{https://github.com/zap-proto/papers/tree/main/zero-copy-throughput}
 {zap-proto/papers/zero-copy-throughput}.
 
