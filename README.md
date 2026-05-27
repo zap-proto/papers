@@ -1,5 +1,8 @@
 # ZAP Protocol — Papers
 
+> **Docs:** [ZAP design papers](https://zap-proto.dev/docs) · part of the [ZAP Protocol](https://zap-proto.io)
+
+
 Formal results on the ZAP wire, transport, and sub-protocol family. Every paper is in LaTeX, brand-neutral, and accompanies a proof in [`../proofs/`](../proofs/).
 
 | # | Paper | Topic | Key result |
