@@ -37,23 +37,30 @@ def num(x, dp=0):
     return f"{x:,.{dp}f}".replace(",", r"\,")
 
 
-SECTIONS = ["=== allocation + throughput", "=== wire bytes ===",
-            "=== concurrent throughput", "=== environment after ==="]
+# The harness marks the allocation section either way it has spelled it, and
+# marks a rate section NOT MEASURED when the machine was too loaded to measure
+# one. Both are findable; a run still in flight is not, and is refused.
+ALLOC = re.compile(r"^=== allocation[^=\n]*===$", re.M)
+WIREH = "=== wire bytes ==="
+CONCH = re.compile(r"^=== concurrent throughput([^=\n]*)===$", re.M)
+ENDH = "=== environment after ==="
 
 
 def parse(path):
     txt = open(path).read()
-    missing = [m for m in SECTIONS if m not in txt]
-    if missing:
-        sys.exit(f"emit: {path} is not a complete run -- missing {missing[0]!r}. "
-                 "A run still in flight has no numbers to publish; wait for it "
-                 "to finish, or point emit.py at a finished one.")
-    out = {"txt": txt}
+    a = ALLOC.search(txt)
+    for what, ok in [("an allocation section", a), (repr(WIREH), WIREH in txt),
+                     (repr(ENDH), ENDH in txt)]:
+        if not ok:
+            sys.exit(f"emit: {path} is not a complete run -- no {what}. "
+                     "A run still in flight has no numbers to publish; wait for "
+                     "it to finish, or point emit.py at a finished one.")
+    out = {"txt": txt, "alloc_header": a.group(0)}
 
     loads = LOAD.findall(txt)
     out["load"] = (float(loads[0]), float(loads[-1]))
 
-    sec = txt.split("=== allocation + throughput")[1].split("=== wire bytes")[0]
+    sec = txt.split(out["alloc_header"])[1].split(WIREH)[0]
     mem, bodies, cur = {}, {}, None
     for line in sec.splitlines():
         m = re.search(r"workload: (\w+) \(body=(\d+) B, headers=(\d+)\)", line)
@@ -78,7 +85,12 @@ def parse(path):
             wire[(cur, m.group(1))] = int(m.group(2))
     out["wire"] = wire
 
-    sec = txt.split("=== concurrent throughput")[1].split("=== per-op benchmarks")[0]
+    m = CONCH.search(txt)
+    out["conc_measured"] = bool(m) and "NOT MEASURED" not in m.group(1)
+    if not out["conc_measured"]:
+        out["conc"] = {}
+        return out
+    sec = txt.split(m.group(0))[1].split("=== per-op benchmarks")[0]
     conc, cur = {}, None
     for line in sec.splitlines():
         m = re.search(r"workload: (\w+) @ (\d+) workers", line)
@@ -89,6 +101,11 @@ def parse(path):
             conc.setdefault((cur, m.group(1)), []).append(int(m.group(2)))
     out["conc"] = conc
     return out
+
+
+def finish(lines):
+    open("results.tex", "w").write("\n".join(lines) + "\n")
+    print("results.tex written")
 
 
 def main():
@@ -158,6 +175,11 @@ def main():
     rows("wireRows", body)
 
     # --- concurrent throughput --------------------------------------------
+    # A run that refused to measure rates prints no table and says so; the
+    # section is switched off rather than filled with the last run's numbers.
+    L.append(r"\newif\ifconcMeasured")
+    L.append(r"\concMeasured" + ("true" if d["conc_measured"] else "false"))
+    L.append("")
     cw = [w for w in ORDER if (w, "net/http") in conc]
     body = []
     for i, w in enumerate(cw):
@@ -175,28 +197,34 @@ def main():
     macro("loadEnd", f"{d['load'][1]:.1f}")
     macro("loadLo", f"{min(d['load']):.0f}")
     macro("loadHi", f"{max(d['load']):.0f}")
-    macro("nWorkloads", {2: "two", 3: "three", 4: "four", 5: "five"}[len(sizes)])
+    words = {2: "two", 3: "three", 4: "four", 5: "five"}[len(sizes)]
+    macro("nWorkloads", words)
+    macro("NWorkloads", words.capitalize())
     macro("nReps", str(len(mem[(sizes[0], "net/http")])))
     macro("nWorkers", str(d.get("workers", 32)))
-    macro("concReqs", num(max(max(v) for v in conc.values()) and
-                          int(re.search(r"(\d+) reqs in", 
-                              d["txt"].split("=== concurrent throughput")[1]).group(1))))
+    if conc:
+        m = re.search(r"(\d+) reqs in", d["txt"].split(CONCH.search(d["txt"]).group(0))[1])
+        macro("concReqs", num(int(m.group(1))))
     macro("memReqs", num(mem and int(re.search(r"(\d+) reqs in", d["txt"]).group(1))))
 
-    # paired ratios against net/http and fasthttp, over concurrent repetitions
-    def bracket(w, arm, base):
-        r = [x / y for x, y in zip(conc[(w, arm)], conc[(w, base)])]
-        return min(r), max(r)
+    # Paired ratios against net/http and fasthttp, over concurrent repetitions.
+    # Only defined when the run actually timed something; main.tex guards every
+    # use with \ifconcMeasured, so a rate-free run prints prose instead of a
+    # number rather than borrowing one from an older run.
+    if d["conc_measured"]:
+        def bracket(w, arm, base):
+            r = [x / y for x, y in zip(conc[(w, arm)], conc[(w, base)])]
+            return min(r), max(r)
 
-    lo = min(bracket(w, a, "net/http")[0] for w in cw for a in ["ZAP-HTTP", "native ZAP"])
-    hi = max(bracket(w, a, "net/http")[1] for w in cw for a in ["ZAP-HTTP", "native ZAP"])
-    macro("zapVsStdLo", f"{lo:.1f}")
-    macro("zapVsStdHi", f"{hi:.1f}")
-    for w in cw:
-        for a, key in [("ZAP-HTTP", "Zap"), ("native ZAP", "Nat")]:
-            r = [x / y for x, y in zip(conc[(w, a)], conc[(w, "fasthttp")])]
-            macro(f"paired{key}{w.capitalize()}",
-                  ", ".join(f"${x:.2f}$" for x in r))
+        lo = min(bracket(w, a, "net/http")[0] for w in cw for a in ["ZAP-HTTP", "native ZAP"])
+        hi = max(bracket(w, a, "net/http")[1] for w in cw for a in ["ZAP-HTTP", "native ZAP"])
+        macro("zapVsStdLo", f"{lo:.1f}")
+        macro("zapVsStdHi", f"{hi:.1f}")
+        for w in cw:
+            for a, key in [("ZAP-HTTP", "Zap"), ("native ZAP", "Nat")]:
+                r = [x / y for x, y in zip(conc[(w, a)], conc[(w, "fasthttp")])]
+                macro(f"paired{key}{w.capitalize()}",
+                      ", ".join(f"${x:.2f}$" for x in r))
 
     # the sequential spread the paper quotes, taken from the widest arm
     worst = max(((max(v[0] for v in vals) / max(min(v[0] for v in vals), 1), k)
@@ -233,10 +261,7 @@ def main():
         macro(f"body{w.capitalize()}", num(B))
         macro(f"natK{w.capitalize()}", f"{b - 2 * B:.0f}")
 
-    open("results.tex", "w").write("\n".join(L) + "\n")
-    print(f"results.tex written from {src}: {len(sizes)} workloads, "
-          f"{len(mem[(sizes[0], 'net/http')])} repetitions, load "
-          f"{d['load'][0]:.1f} to {d['load'][1]:.1f}")
+    finish(L)
 
 
 if __name__ == "__main__":
