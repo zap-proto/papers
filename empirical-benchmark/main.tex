@@ -5,7 +5,6 @@
 \usepackage{listings}
 \usepackage{xcolor}
 \usepackage{hyperref}
-\usepackage{cleveref}
 
 \hypersetup{
   colorlinks=true,
@@ -198,7 +197,7 @@ included. A claim with no matching line in it has no evidence behind it.
 
 \subsection{Bytes allocated per request}
 
-\begin{table}[h]
+\begin{table}[ht]
 \centering
 \begin{tabular}{lrrrrr}
 \toprule
@@ -224,7 +223,7 @@ difference is residual, and the wire is not costing anything.
 
 \subsection{Allocations per request}
 
-\begin{table}[h]
+\begin{table}[ht]
 \centering
 \begin{tabular}{lrrrrr}
 \toprule
@@ -253,7 +252,7 @@ not be read as making the second one.
 
 \subsection{Garbage collection over \texorpdfstring{\memReqs}{5000} requests}
 
-\begin{table}[h]
+\begin{table}[ht]
 \centering
 \begin{tabular}{lrrrrr}
 \toprule
@@ -272,7 +271,7 @@ it triggers a third as many cycles as \texttt{net/http}, not none.
 
 \subsection{Wire bytes}
 
-\begin{table}[h]
+\begin{table}[ht]
 \centering
 \begin{tabular}{lrrr}
 \toprule
@@ -304,7 +303,7 @@ names the direction, so a ratio cannot be read backwards.
 
 \subsection{Throughput}
 
-\begin{table}[h]
+\begin{table}[ht]
 \centering
 \begin{tabular}{lrrrr}
 \toprule

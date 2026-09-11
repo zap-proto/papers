@@ -43,6 +43,15 @@ cd pq-hybrid-kem && make    # produces main.pdf
 cd ../proofs/pq-hybrid-kem && make    # produces proof.pdf
 ```
 
+`transport-vs-jwt` uses `\cref`, so it needs `cleveref`, which a minimal TeX
+Live such as TinyTeX does not ship. Without it `latexmk -Werror` stops at the
+preamble and writes no PDF, which reads like a broken paper rather than a
+missing package:
+
+```sh
+tlmgr install cleveref
+```
+
 ## License
 
 CC-BY-4.0 for the paper text; MIT OR Apache-2.0 for any code samples.
